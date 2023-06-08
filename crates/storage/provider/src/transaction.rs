@@ -1,4 +1,4 @@
-use reth_interfaces::{db::DatabaseError as DbError, provider::ProviderError};
+use reth_interfaces::{db::DatabaseError as DbError, provider::ProviderError, executor::{BlockExecutionError, BlockValidationError}};
 use reth_primitives::{BlockHash, BlockNumber, H256};
 use reth_trie::StateRootError;
 use std::fmt::Debug;
@@ -42,6 +42,18 @@ pub enum TransactionError {
     /// Internal interfaces error
     #[error("Internal error")]
     InternalError(#[from] reth_interfaces::Error),
+}
+
+impl From<TransactionError> for BlockExecutionError {
+    fn from(value: TransactionError) -> Self {
+        match value {
+            TransactionError::StateRootMismatch { expected, got, block_number, block_hash } => {
+                BlockValidationError::StateRootMismatch { expected, got, block_number, block_hash }
+                    .into()
+            }
+            err => Self::CanonicalCommit { inner: err.to_string() },
+        }
+    }
 }
 
 #[cfg(test)]
