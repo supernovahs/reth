@@ -11,7 +11,10 @@ use reth_primitives::{
     Address, Block, BlockNumber, Bloom, ChainSpec, Hardfork, Header, Receipt, ReceiptWithBloom,
     TransactionSigned, H256, U256,
 };
-use reth_provider::{BlockExecutor, PostState, StateChange, StateProvider};
+use reth_provider::{
+    chain::BlockReceipts, change::StateReverts, BlockExecutor, PostState, StateChange,
+    StateProvider,
+};
 use revm::{primitives::ResultAndState, DatabaseCommit, State as RevmState, EVM};
 use std::{
     collections::HashMap,
@@ -172,10 +175,10 @@ impl<'a> NewExecutor<'a> {
             );
             output
         } else {
-            let exec_time = Instant::now();
+            //let exec_time = Instant::now();
             // main execution.
             let res = self.evm.transact();
-            self.execution_time += exec_time.elapsed();
+            //self.execution_time += exec_time.elapsed();
             res
         };
         out.map_err(|e| BlockExecutionError::EVM { hash, message: format!("{e:?}") })
@@ -200,7 +203,7 @@ impl<'a> NewExecutor<'a> {
         // perf: do not execute empty blocks
         if block.body.is_empty() {
             self.receipts.push((block.number, Vec::new()));
-            return Ok(0)
+            return Ok(0);
         }
         let senders = self.recover_senders(&block.body, senders)?;
 
@@ -216,7 +219,7 @@ impl<'a> NewExecutor<'a> {
                 return Err(BlockExecutionError::TransactionGasLimitMoreThanAvailableBlockGas {
                     transaction_gas_limit: transaction.gas_limit(),
                     block_available_gas,
-                })
+                });
             }
             // Execute transaction.
             let ResultAndState { result, state } = self.transact(transaction, sender)?;
@@ -260,7 +263,7 @@ impl<'a, SP: StateProvider> BlockExecutor<SP> for NewExecutor<'a> {
             return Err(BlockExecutionError::BlockGasUsed {
                 got: cumulative_gas_used,
                 expected: block.gas_used,
-            })
+            });
         }
 
         // Add block rewards
@@ -298,7 +301,7 @@ impl<'a, SP: StateProvider> BlockExecutor<SP> for NewExecutor<'a> {
         // transaction This was replaced with is_success flag.
         // See more about EIP here: https://eips.ethereum.org/EIPS/eip-658
         if self.chain_spec.fork(Hardfork::Byzantium).active_at_block(block.header.number) {
-            let receipt_time = Instant::now();
+            //let receipt_time = Instant::now();
             if let Err(e) = verify_receipt(
                 block.header.receipts_root,
                 block.header.logs_bloom,
@@ -310,17 +313,23 @@ impl<'a, SP: StateProvider> BlockExecutor<SP> for NewExecutor<'a> {
                     e,
                     self.receipts.last().unwrap()
                 );
-                return Err(e)
+                return Err(e);
             };
-            self.receipts_root_time += receipt_time.elapsed();
+            //self.receipts_root_time += receipt_time.elapsed();
         }
 
         Ok(post_state)
     }
 
-    fn take_state_change(&mut self) -> StateChange {
+    fn take_receipts(&mut self) -> Vec<(BlockNumber, Vec<Receipt>)> {
+        std::mem::take(&mut self.receipts)
+    }
+
+    fn take_changes_and_reverts(&mut self) -> (StateChange, StateReverts) {
         // TODO remove print times
+        /*
         self.evm.eval_times.print();
+
         println!(" X - {:?} execution time", self.execution_time);
         println!(" X - {:?} receipt root time", self.receipts_root_time);
         println!("   E - {:?} apply evm state", self.evm.db().unwrap().eval_times.apply_evm_time);
@@ -332,7 +341,9 @@ impl<'a, SP: StateProvider> BlockExecutor<SP> for NewExecutor<'a> {
         println!("   DB - {:?} get account", self.evm.db().unwrap().eval_times.get_account_time);
         println!("   DB - {:?} get storage", self.evm.db().unwrap().eval_times.get_storage_time);
         println!("   DB - {:?} get code", self.evm.db().unwrap().eval_times.get_code_time);
-        self.evm.db().unwrap().take_bundle().take_sorted_plain_change().into()
+        */
+        let mut bundle = self.evm.db().unwrap().take_bundle();
+        (bundle.take_sorted_plain_change().into(), bundle.take_reverts().into())
     }
 }
 
@@ -349,7 +360,7 @@ pub fn verify_receipt<'a>(
         return Err(BlockExecutionError::ReceiptRootDiff {
             got: receipts_root,
             expected: expected_receipts_root,
-        })
+        });
     }
 
     // Create header log bloom.
@@ -358,7 +369,7 @@ pub fn verify_receipt<'a>(
         return Err(BlockExecutionError::BloomLogDiff {
             expected: Box::new(expected_logs_bloom),
             got: Box::new(logs_bloom),
-        })
+        });
     }
 
     Ok(())

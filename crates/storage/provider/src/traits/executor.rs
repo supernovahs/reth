@@ -1,8 +1,10 @@
 //! Executor Factory
 
-use crate::{post_state::PostState, StateChange, StateProvider};
+use crate::{
+    chain::BlockReceipts, change::StateReverts, post_state::PostState, StateChange, StateProvider,
+};
 use reth_interfaces::executor::BlockExecutionError;
-use reth_primitives::{Address, Block, ChainSpec, U256};
+use reth_primitives::{Address, Block, BlockNumber, ChainSpec, Receipt, U256};
 
 /// Executor factory that would create the EVM with particular state provider.
 ///
@@ -53,8 +55,12 @@ pub trait BlockExecutor<SP: StateProvider> {
 
     /// TEMPORARY return post state after execution multiple blocks.
     /// Idea is to hide multi block execution.
-    fn take_state_change(&mut self) -> StateChange {
+    fn take_changes_and_reverts(&mut self) -> (StateChange, StateReverts) {
         panic!("Not implemented");
-        //StateChange::default()
+    }
+
+    /// TODO Temporary return receipts after execution of multiple blocks
+    fn take_receipts(&mut self) -> Vec<(BlockNumber, Vec<Receipt>)> {
+        panic!("Not implemented");
     }
 }
