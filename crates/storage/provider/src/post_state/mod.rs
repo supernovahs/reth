@@ -80,6 +80,30 @@ pub struct PostState {
     receipts: BTreeMap<BlockNumber, Vec<Receipt>>,
 }
 
+/// Trait that exposes the public API of [PostState].
+pub trait PostStateTrait {
+    /// Hint size of it, used to check if we should flush data to disk.
+    fn size_hint(&self) -> usize;
+
+    /// Returns an iterator over all logs in this [PostState].
+    fn logs<'a, T: Iterator<Item = &'a Log>>(&'a self, block: BlockNumber) -> T;
+
+    /// Returns the logs bloom for particular block
+    fn logs_bloom(&self, block: BlockNumber) -> Bloom;
+
+    /// Calculate the state root for this [PostState].
+    fn state_root_slow<'a, 'tx, TX: DbTx<'tx>>(&self, tx: &'a TX) -> Result<H256, StateRootError>;
+
+    /// Extend this post state with another post state.
+    fn extend(&mut self, other: Self);
+
+    /// Revert state to previous one
+    fn revert_to(&mut self, target_block_number: BlockNumber);
+
+    /// Reverts each change up to and including any change that is part of `transition_id`.
+    fn split_at(&mut self, revert_to_block: BlockNumber) -> Self;
+}
+
 impl PostState {
     /// Create an empty [PostState].
     pub fn new() -> Self {

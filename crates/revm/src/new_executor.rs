@@ -11,17 +11,10 @@ use reth_primitives::{
     Address, Block, BlockNumber, Bloom, ChainSpec, Hardfork, Header, Receipt, ReceiptWithBloom,
     TransactionSigned, H256, U256,
 };
-use reth_provider::{
-    chain::BlockReceipts, change::StateReverts, BlockExecutor, PostState, StateChange,
-    StateProvider,
-};
+use reth_provider::{change::StateReverts, BlockExecutor, PostState, StateChange, StateProvider};
 use revm::{primitives::ResultAndState, DatabaseCommit, State as RevmState, EVM};
-use std::{
-    collections::HashMap,
-    sync::Arc,
-    time::{Duration, Instant},
-};
-use tracing::{debug, warn};
+use std::sync::Arc;
+use tracing::debug;
 
 /// Main block executor
 pub struct NewExecutor<'a> {
@@ -30,8 +23,6 @@ pub struct NewExecutor<'a> {
     evm: EVM<RevmState<'a, Error>>,
     stack: InspectorStack,
     receipts: Vec<(BlockNumber, Vec<Receipt>)>,
-    execution_time: Duration,
-    receipts_root_time: Duration,
 }
 
 impl<'a> From<Arc<ChainSpec>> for NewExecutor<'a> {
@@ -44,8 +35,6 @@ impl<'a> From<Arc<ChainSpec>> for NewExecutor<'a> {
             evm,
             stack: InspectorStack::new(InspectorStackConfig::default()),
             receipts: Vec::new(),
-            execution_time: Default::default(),
-            receipts_root_time: Default::default(),
         }
     }
 }
@@ -62,8 +51,6 @@ impl<'a> NewExecutor<'a> {
             evm,
             stack: InspectorStack::new(InspectorStackConfig::default()),
             receipts: Vec::new(),
-            execution_time: Default::default(),
-            receipts_root_time: Default::default(),
         }
     }
 
@@ -106,51 +93,48 @@ impl<'a> NewExecutor<'a> {
         );
     }
 
-    /// Collect all balance changes at the end of the block.
-    ///
-    /// Balance changes might include the block reward, uncle rewards, withdrawals, or irregular
-    /// state changes (DAO fork).
-    fn post_block_balance_increments(&self, block: &Block, td: U256) -> HashMap<Address, U256> {
-        post_block_balance_increments(
+    /// Post execution state change that include block reward, withdrawals and iregular DAO hardfork
+    /// state change.
+    fn post_execution_state_change(
+        &mut self,
+        block: &Block,
+        total_difficulty: U256,
+    ) -> Result<(), BlockExecutionError> {
+        let mut balance_increments = post_block_balance_increments(
             &self.chain_spec,
             block.number,
             block.difficulty,
             block.beneficiary,
             block.timestamp,
-            td,
+            total_difficulty,
             &block.ommers,
             block.withdrawals.as_deref(),
-        )
+        );
+
+        // Irregular state change at Ethereum DAO hardfork
+        if self.chain_spec.fork(Hardfork::Dao).transitions_at_block(block.number) {
+            // drain balances from hardcoded addresses.
+            let drained_balance: u128 = self
+                .db()
+                .drain_balances(DAO_HARDKFORK_ACCOUNTS.into_iter())
+                .map_err(|_| BlockExecutionError::IncrementBalanceFailed)?
+                .into_iter()
+                .sum();
+
+            // return balance to DAO beneficiary.
+            *balance_increments.entry(DAO_HARDFORK_BENEFICIARY).or_default() +=
+                U256::from(drained_balance);
+        }
+
+        // increment balances
+        self.db()
+            .increment_balances(
+                balance_increments.into_iter().map(|(k, v)| (k, v.try_into().unwrap())),
+            )
+            .map_err(|_| BlockExecutionError::IncrementBalanceFailed)?;
+
+        Ok(())
     }
-
-    /// Irregular state change at Ethereum DAO hardfork
-    // fn apply_dao_fork_changes(
-    //     &mut self,
-    //     block_number: BlockNumber,
-    //     post_state: &mut PostState,
-    // ) -> Result<(), BlockExecutionError> {
-    //     let db = self.db();
-
-    //     let mut drained_balance = U256::ZERO;
-
-    //     // drain all accounts ether
-    //     for address in DAO_HARDKFORK_ACCOUNTS {
-    //         let db_account =
-    //             db.load_account(address).map_err(|_| BlockExecutionError::ProviderError)?;
-    //         let old = to_reth_acc(&db_account.info);
-    //         // drain balance
-    //         drained_balance += core::mem::take(&mut db_account.info.balance);
-    //         let new = to_reth_acc(&db_account.info);
-    //         // assume it is changeset as it is irregular state change
-    //         post_state.change_account(block_number, address, old, new);
-    //     }
-
-    //     // add drained ether to beneficiary.
-    //     let beneficiary = DAO_HARDFORK_BENEFICIARY;
-    //     self.increment_account_balance(block_number, beneficiary, drained_balance, post_state)?;
-
-    //     Ok(())
-    // }
 
     /// Runs a single transaction in the configured environment and proceeds
     /// to return the result and state diff (without applying it).
@@ -175,11 +159,8 @@ impl<'a> NewExecutor<'a> {
             );
             output
         } else {
-            //let exec_time = Instant::now();
             // main execution.
-            let res = self.evm.transact();
-            //self.execution_time += exec_time.elapsed();
-            res
+            self.evm.transact()
         };
         out.map_err(|e| BlockExecutionError::EVM { hash, message: format!("{e:?}") })
     }
@@ -203,7 +184,7 @@ impl<'a> NewExecutor<'a> {
         // perf: do not execute empty blocks
         if block.body.is_empty() {
             self.receipts.push((block.number, Vec::new()));
-            return Ok(0);
+            return Ok(0)
         }
         let senders = self.recover_senders(&block.body, senders)?;
 
@@ -219,7 +200,7 @@ impl<'a> NewExecutor<'a> {
                 return Err(BlockExecutionError::TransactionGasLimitMoreThanAvailableBlockGas {
                     transaction_gas_limit: transaction.gas_limit(),
                     block_available_gas,
-                });
+                })
             }
             // Execute transaction.
             let ResultAndState { result, state } = self.transact(transaction, sender)?;
@@ -263,23 +244,13 @@ impl<'a, SP: StateProvider> BlockExecutor<SP> for NewExecutor<'a> {
             return Err(BlockExecutionError::BlockGasUsed {
                 got: cumulative_gas_used,
                 expected: block.gas_used,
-            });
+            })
         }
 
-        // Add block rewards
-        let balance_increments = self.post_block_balance_increments(block, total_difficulty);
-        self.db()
-            .increment_balances(
-                balance_increments.into_iter().map(|(k, v)| (k, v.try_into().unwrap())),
-            )
-            .map_err(|_| BlockExecutionError::IncrementBalanceFailed)?;
+        self.post_execution_state_change(block, total_difficulty)?;
 
         self.db().merge_transitions();
-
-        // TODO Perform DAO irregular state change
-        // if self.chain_spec.fork(Hardfork::Dao).transitions_at_block(block.number) {
-        //     self.apply_dao_fork_changes(block.number, &mut post_state)?;
-        // }
+        // TODO remove PostState
         Ok(PostState::default())
     }
 
@@ -301,7 +272,6 @@ impl<'a, SP: StateProvider> BlockExecutor<SP> for NewExecutor<'a> {
         // transaction This was replaced with is_success flag.
         // See more about EIP here: https://eips.ethereum.org/EIPS/eip-658
         if self.chain_spec.fork(Hardfork::Byzantium).active_at_block(block.header.number) {
-            //let receipt_time = Instant::now();
             if let Err(e) = verify_receipt(
                 block.header.receipts_root,
                 block.header.logs_bloom,
@@ -313,9 +283,8 @@ impl<'a, SP: StateProvider> BlockExecutor<SP> for NewExecutor<'a> {
                     e,
                     self.receipts.last().unwrap()
                 );
-                return Err(e);
+                return Err(e)
             };
-            //self.receipts_root_time += receipt_time.elapsed();
         }
 
         Ok(post_state)
@@ -326,22 +295,6 @@ impl<'a, SP: StateProvider> BlockExecutor<SP> for NewExecutor<'a> {
     }
 
     fn take_changes_and_reverts(&mut self) -> (StateChange, StateReverts) {
-        // TODO remove print times
-        /*
-        self.evm.eval_times.print();
-
-        println!(" X - {:?} execution time", self.execution_time);
-        println!(" X - {:?} receipt root time", self.receipts_root_time);
-        println!("   E - {:?} apply evm state", self.evm.db().unwrap().eval_times.apply_evm_time);
-        println!(
-            "   E - {:?} apply transition state",
-            self.evm.db().unwrap().eval_times.apply_transition_time
-        );
-        println!("   E - {:?} merge time", self.evm.db().unwrap().eval_times.merge_time);
-        println!("   DB - {:?} get account", self.evm.db().unwrap().eval_times.get_account_time);
-        println!("   DB - {:?} get storage", self.evm.db().unwrap().eval_times.get_storage_time);
-        println!("   DB - {:?} get code", self.evm.db().unwrap().eval_times.get_code_time);
-        */
         let mut bundle = self.evm.db().unwrap().take_bundle();
         (bundle.take_sorted_plain_change().into(), bundle.take_reverts().into())
     }
@@ -360,7 +313,7 @@ pub fn verify_receipt<'a>(
         return Err(BlockExecutionError::ReceiptRootDiff {
             got: receipts_root,
             expected: expected_receipts_root,
-        });
+        })
     }
 
     // Create header log bloom.
@@ -369,7 +322,7 @@ pub fn verify_receipt<'a>(
         return Err(BlockExecutionError::BloomLogDiff {
             expected: Box::new(expected_logs_bloom),
             got: Box::new(logs_bloom),
-        });
+        })
     }
 
     Ok(())

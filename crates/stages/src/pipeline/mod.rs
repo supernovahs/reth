@@ -409,7 +409,6 @@ where
                             stage = %stage_id,
                             "Stage encountered a non-fatal error: {err}. Retrying"
                         );
-                        panic!("TODO PANIC RAKITA DONT FORGET");
                         continue
                     };
                     return out

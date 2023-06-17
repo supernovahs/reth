@@ -1,16 +1,5 @@
-use crate::{
-    database::SubState,
-    env::{fill_cfg_and_block_env, fill_tx_env},
-    eth_dao_fork::{DAO_HARDFORK_BENEFICIARY, DAO_HARDKFORK_ACCOUNTS},
-    into_reth_log,
-    stack::{InspectorStack, InspectorStackConfig},
-    to_reth_acc,
-};
 use reth_consensus_common::calc;
-use reth_primitives::{
-    Account, Address, Block, BlockNumber, Bloom, Bytecode, ChainSpec, Hardfork, Header, Receipt,
-    ReceiptWithBloom, TransactionSigned, Withdrawal, H256, U256,
-};
+use reth_primitives::{Address, ChainSpec, Hardfork, Header, Withdrawal, U256};
 use std::collections::HashMap;
 
 /// Collect all balance changes at the end of the block.

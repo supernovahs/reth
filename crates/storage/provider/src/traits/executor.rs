@@ -1,8 +1,6 @@
 //! Executor Factory
 
-use crate::{
-    chain::BlockReceipts, change::StateReverts, post_state::PostState, StateChange, StateProvider,
-};
+use crate::{change::StateReverts, post_state::PostState, StateChange, StateProvider};
 use reth_interfaces::executor::BlockExecutionError;
 use reth_primitives::{Address, Block, BlockNumber, ChainSpec, Receipt, U256};
 

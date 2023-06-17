@@ -145,9 +145,7 @@ impl<EF: ExecutorFactory> ExecutionStage<EF> {
         let mut stage_progress = start_block;
 
         // Execute block range
-        //let mut state = PostState::default();
         debug!(target: "sync::stages::execution", start = start_block, end = max_block, "Executing range");
-        let time = Instant::now();
         let mut block_read_time = Duration::default();
         for block_number in start_block..=max_block {
             let read_block_time = Instant::now();
@@ -167,11 +165,9 @@ impl<EF: ExecutorFactory> ExecutionStage<EF> {
                 .mgas_processed_total
                 .increment(block.header.gas_used as f64 / MGAS_TO_GAS as f64);
 
-            // Merge state changes
-            //state.extend(block_state);
             stage_progress = block_number;
 
-            // Write history periodically to free up memory
+            // TODO Write history periodically to free up memory
             // if self.thresholds.should_write_history(state.changeset_size_hint() as u64) {
             //     info!(target: "sync::stages::execution", ?block_number, "Writing history.");
             //     state.write_history_to_db(&**tx)?;
@@ -181,16 +177,12 @@ impl<EF: ExecutorFactory> ExecutionStage<EF> {
 
             // Check if we should commit now
             if self.thresholds.is_end_of_batch(block_number - start_block, 0) {
-                break;
+                break
             }
         }
 
-        //println!("T - {:?} Executed", time.elapsed());
-        //println!("  I - {:?} Block Read time", block_read_time);
-        let take_state_time = Instant::now();
         let (state, reverts) = executor.take_changes_and_reverts();
         let receipts = executor.take_receipts();
-        //println!("  I - {:?} Take State", take_state_time.elapsed());
 
         // TODO move receipts write to provider
         // Write the receipts of the transactions
@@ -198,6 +190,8 @@ impl<EF: ExecutorFactory> ExecutionStage<EF> {
         tracing::trace!(target: "provider::post_state", len = receipts.len(), "Writing receipts");
         let mut bodies_cursor = tx.cursor_read::<tables::BlockBodyIndices>()?;
         let mut receipts_cursor = tx.cursor_write::<tables::Receipts>()?;
+
+        // write receipts
         for (block, receipts) in receipts {
             let (_, body_indices) = bodies_cursor.seek_exact(block)?.expect("body indices exist");
             let tx_range = body_indices.tx_num_range();
@@ -211,8 +205,6 @@ impl<EF: ExecutorFactory> ExecutionStage<EF> {
         // write changes
         state.write_to_db(&**tx)?;
         info!(target: "sync::stages::execution", took = ?start.elapsed(), "Wrote state");
-
-        // TODO write receipts
 
         let is_final_range = stage_progress == max_block;
         info!(target: "sync::stages::execution", stage_progress, is_final_range, "Stage iteration finished");
@@ -275,7 +267,7 @@ impl<EF: ExecutorFactory, DB: Database> Stage<DB> for ExecutionStage<EF> {
             input.unwind_block_range_with_threshold(self.thresholds.max_blocks.unwrap_or(u64::MAX));
 
         if range.is_empty() {
-            return Ok(UnwindOutput { checkpoint: StageCheckpoint::new(input.unwind_to) });
+            return Ok(UnwindOutput { checkpoint: StageCheckpoint::new(input.unwind_to) })
         }
 
         // get all batches for account change
@@ -316,7 +308,7 @@ impl<EF: ExecutorFactory, DB: Database> Stage<DB> for ExecutionStage<EF> {
         let mut rev_acc_changeset_walker = account_changeset.walk_back(None)?;
         while let Some((block_num, _)) = rev_acc_changeset_walker.next().transpose()? {
             if block_num <= unwind_to {
-                break;
+                break
             }
             // delete all changesets
             rev_acc_changeset_walker.delete_current()?;
@@ -325,7 +317,7 @@ impl<EF: ExecutorFactory, DB: Database> Stage<DB> for ExecutionStage<EF> {
         let mut rev_storage_changeset_walker = storage_changeset.walk_back(None)?;
         while let Some((key, _)) = rev_storage_changeset_walker.next().transpose()? {
             if key.block_number() < *range.start() {
-                break;
+                break
             }
             // delete all changesets
             rev_storage_changeset_walker.delete_current()?;
@@ -379,8 +371,8 @@ impl ExecutionStageThresholds {
     /// Check if the batch thresholds have been hit.
     #[inline]
     pub fn is_end_of_batch(&self, blocks_processed: u64, changes_processed: u64) -> bool {
-        blocks_processed >= self.max_blocks.unwrap_or(u64::MAX)
-            || changes_processed >= self.max_changes.unwrap_or(u64::MAX)
+        blocks_processed >= self.max_blocks.unwrap_or(u64::MAX) ||
+            changes_processed >= self.max_changes.unwrap_or(u64::MAX)
     }
 
     /// Check if the history write threshold has been hit.

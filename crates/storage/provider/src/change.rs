@@ -25,6 +25,8 @@ impl From<RevmReverts> for StateReverts {
 
 impl StateReverts {
     /// Write reverts to database.
+    ///
+    /// Note:: Reverts will delete all wiped storage from plain state.
     pub fn write_to_db<'a, TX: DbTxMut<'a> + DbTx<'a>>(
         self,
         tx: &TX,
@@ -52,6 +54,9 @@ impl StateReverts {
                         while let Some(entry) = storages_cursor.next_dup_val()? {
                             wiped_storage.push((entry.key.into(), entry.value))
                         }
+                        // delete all values
+                        storages_cursor.seek_exact(address)?;
+                        storages_cursor.delete_current_duplicates()?;
                     }
                 }
                 tracing::trace!(target: "provider::reverts", "storage changes: {:?}",storage);
@@ -65,7 +70,8 @@ impl StateReverts {
                     }
                 } else {
                     // if there is some of wiped storage, they are both sorted, intersect both of
-                    // them in in conflict use change from revert (discard values from wiped storage).
+                    // them in in conflict use change from revert (discard values from wiped
+                    // storage).
                     let mut wiped_iter = wiped_storage.into_iter();
                     let mut revert_iter = storage.into_iter();
                     // items to apply. both iterators are sorted.
@@ -76,26 +82,30 @@ impl StateReverts {
                             (None, None) => break,
                             (Some(w), None) => {
                                 wiped_item = wiped_iter.next();
-                                w.clone()
+                                w
                             }
                             (None, Some(r)) => {
                                 revert_item = revert_iter.next();
-                                r.clone()
+                                r
                             }
                             (Some(w), Some(r)) => {
-                                if w.0 < r.0 {
-                                    wiped_item = wiped_iter.next();
-                                    // next key is from revert storage
-                                    w.clone()
-                                } else if w.0 > r.0 {
-                                    revert_item = revert_iter.next();
-                                    // next key is from wiped storage
-                                    r.clone()
-                                } else {
-                                    wiped_item = wiped_iter.next();
-                                    revert_item = revert_iter.next();
-                                    // priority goes for storage if key is same.
-                                    r.clone()
+                                match w.0.cmp(&r.0) {
+                                    std::cmp::Ordering::Less => {
+                                        // next key is from revert storage
+                                        wiped_item = wiped_iter.next();
+                                        w
+                                    }
+                                    std::cmp::Ordering::Greater => {
+                                        // next key is from wiped storage
+                                        revert_item = revert_iter.next();
+                                        r
+                                    }
+                                    std::cmp::Ordering::Equal => {
+                                        // priority goes for storage if key is same.
+                                        wiped_item = wiped_iter.next();
+                                        revert_item = revert_iter.next();
+                                        r
+                                    }
                                 }
                             }
                         };
@@ -117,7 +127,7 @@ impl StateReverts {
             for (address, info) in account_block_reverts {
                 account_changeset_cursor.append_dup(
                     block_number,
-                    AccountBeforeTx { address, info: info.map(|a| into_reth_acc(a)) },
+                    AccountBeforeTx { address, info: info.map(into_reth_acc) },
                 )?;
             }
         }
@@ -147,8 +157,8 @@ impl StateChange {
             // // If the storage was wiped at least once, remove all previous entries from the
             // // database.
             // if wipped {
-            //     tracing::trace!(target: "provider::post_state", ?address, "Wiping storage from plain state");
-            //     if storages_cursor.seek_exact(address)?.is_some() {
+            //     tracing::trace!(target: "provider::post_state", ?address, "Wiping storage from
+            // plain state");     if storages_cursor.seek_exact(address)?.is_some() {
             //         storages_cursor.delete_current_duplicates()?;
             //     }
             // }
