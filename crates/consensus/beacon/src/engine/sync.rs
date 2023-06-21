@@ -1,5 +1,6 @@
 //! Sync management for the engine implementation.
 
+use crate::engine::metrics::EngineSyncMetrics;
 use futures::FutureExt;
 use reth_db::database::Database;
 use reth_interfaces::p2p::{
@@ -47,6 +48,8 @@ where
     /// Max block after which the consensus engine would terminate the sync. Used for debugging
     /// purposes.
     max_block: Option<BlockNumber>,
+    /// Engine sync metrics.
+    metrics: EngineSyncMetrics,
 }
 
 impl<DB, Client> EngineSyncController<DB, Client>
@@ -71,7 +74,13 @@ where
             queued_events: VecDeque::new(),
             run_pipeline_continuously,
             max_block,
+            metrics: EngineSyncMetrics::default(),
         }
+    }
+
+    /// Sets the metrics for the active downloads
+    fn update_block_download_metrics(&self) {
+        self.metrics.active_block_downloads.set(self.inflight_full_block_requests.len() as f64);
     }
 
     /// Sets the max block value for testing
@@ -83,16 +92,23 @@ where
     /// Cancels all full block requests that are in progress.
     pub(crate) fn clear_full_block_requests(&mut self) {
         self.inflight_full_block_requests.clear();
+        self.update_block_download_metrics();
     }
 
     /// Cancels the full block request with the given hash.
     pub(crate) fn cancel_full_block_request(&mut self, hash: H256) {
         self.inflight_full_block_requests.retain(|req| *req.hash() != hash);
+        self.update_block_download_metrics();
     }
 
     /// Returns whether or not the sync controller is set to run the pipeline continuously.
     pub(crate) fn run_pipeline_continuously(&self) -> bool {
         self.run_pipeline_continuously
+    }
+
+    /// Returns `true` if a pipeline target is queued and will be triggered on the next `poll`.
+    pub(crate) fn is_pipeline_sync_pending(&self) -> bool {
+        self.pending_pipeline_target.is_some() && self.pipeline_state.is_idle()
     }
 
     /// Returns `true` if the pipeline is idle.
@@ -125,6 +141,9 @@ where
         );
         let request = self.full_block_client.get_full_block(hash);
         self.inflight_full_block_requests.push(request);
+
+        self.update_block_download_metrics();
+
         true
     }
 
@@ -240,6 +259,8 @@ where
                     self.inflight_full_block_requests.push(request);
                 }
             }
+
+            self.update_block_download_metrics();
 
             if !self.pipeline_state.is_idle() || self.queued_events.is_empty() {
                 // can not make any progress

@@ -1,5 +1,6 @@
 //! Database debugging tool
 use crate::{
+    args::utils::genesis_value_parser,
     dirs::{DataDirPath, MaybePlatformPath},
     utils::DbTool,
 };
@@ -9,7 +10,6 @@ use eyre::WrapErr;
 use human_bytes::human_bytes;
 use reth_db::{database::Database, tables};
 use reth_primitives::ChainSpec;
-use reth_staged_sync::utils::chainspec::genesis_value_parser;
 use std::sync::Arc;
 use tracing::error;
 
@@ -100,7 +100,7 @@ impl Command {
             reth_db::mdbx::EnvKind::RW,
         )?;
 
-        let mut tool = DbTool::new(&db)?;
+        let mut tool = DbTool::new(&db, self.chain.clone())?;
 
         match self.command {
             // TODO: We'll need to add this on the DB trait.
@@ -117,7 +117,10 @@ impl Command {
                 ]);
 
                 tool.db.view(|tx| {
-                    for table in tables::TABLES.iter().map(|(_, name)| name) {
+                    let mut tables =
+                        tables::TABLES.iter().map(|(_, name)| name).collect::<Vec<_>>();
+                    tables.sort();
+                    for table in tables {
                         let table_db =
                             tx.inner.open_db(Some(table)).wrap_err("Could not open db.")?;
 

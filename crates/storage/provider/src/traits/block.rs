@@ -1,10 +1,12 @@
 use crate::{
     BlockIdProvider, BlockNumProvider, HeaderProvider, ReceiptProvider, TransactionsProvider,
+    WithdrawalsProvider,
 };
 use reth_db::models::StoredBlockBodyIndices;
 use reth_interfaces::Result;
 use reth_primitives::{
-    Block, BlockHashOrNumber, BlockId, BlockNumberOrTag, Header, SealedBlock, SealedHeader, H256,
+    Block, BlockHashOrNumber, BlockId, BlockNumber, BlockNumberOrTag, BlockWithSenders, Header,
+    SealedBlock, SealedHeader, H256,
 };
 
 /// A helper enum that represents the origin of the requested block.
@@ -44,7 +46,13 @@ impl BlockSource {
 /// the database.
 #[auto_impl::auto_impl(&, Arc)]
 pub trait BlockProvider:
-    BlockNumProvider + HeaderProvider + TransactionsProvider + ReceiptProvider + Send + Sync
+    BlockNumProvider
+    + HeaderProvider
+    + TransactionsProvider
+    + ReceiptProvider
+    + WithdrawalsProvider
+    + Send
+    + Sync
 {
     /// Tries to find in the given block source.
     ///
@@ -63,12 +71,6 @@ pub trait BlockProvider:
     /// Note: This returns a [SealedBlock] because it's expected that this is sealed by the provider
     /// and the caller does not know the hash.
     fn pending_block(&self) -> Result<Option<SealedBlock>>;
-
-    /// Returns the pending block header if available
-    ///
-    /// Note: This returns a [SealedHeader] because it's expected that this is sealed by the
-    /// provider and the caller does not know the hash.
-    fn pending_header(&self) -> Result<Option<SealedHeader>>;
 
     /// Returns the ommers/uncle headers of the given block from the database.
     ///
@@ -93,6 +95,11 @@ pub trait BlockProvider:
     ///
     /// Returns `None` if block is not found.
     fn block_body_indices(&self, num: u64) -> Result<Option<StoredBlockBodyIndices>>;
+
+    /// Returns the block with senders with matching number from database.
+    ///
+    /// Returns `None` if block is not found.
+    fn block_with_senders(&self, number: BlockNumber) -> Result<Option<BlockWithSenders>>;
 }
 
 /// Trait extension for `BlockProvider`, for types that implement `BlockId` conversion.
@@ -112,6 +119,38 @@ pub trait BlockProviderIdExt: BlockProvider + BlockIdProvider {
     /// Returns `None` if block is not found.
     fn block_by_number_or_tag(&self, id: BlockNumberOrTag) -> Result<Option<Block>> {
         self.convert_block_number(id)?.map_or_else(|| Ok(None), |num| self.block(num.into()))
+    }
+
+    /// Returns the pending block header if available
+    ///
+    /// Note: This returns a [SealedHeader] because it's expected that this is sealed by the
+    /// provider and the caller does not know the hash.
+    fn pending_header(&self) -> Result<Option<SealedHeader>> {
+        self.sealed_header_by_id(BlockNumberOrTag::Pending.into())
+    }
+
+    /// Returns the latest block header if available
+    ///
+    /// Note: This returns a [SealedHeader] because it's expected that this is sealed by the
+    /// provider and the caller does not know the hash.
+    fn latest_header(&self) -> Result<Option<SealedHeader>> {
+        self.sealed_header_by_id(BlockNumberOrTag::Latest.into())
+    }
+
+    /// Returns the safe block header if available
+    ///
+    /// Note: This returns a [SealedHeader] because it's expected that this is sealed by the
+    /// provider and the caller does not know the hash.
+    fn safe_header(&self) -> Result<Option<SealedHeader>> {
+        self.sealed_header_by_id(BlockNumberOrTag::Safe.into())
+    }
+
+    /// Returns the finalized block header if available
+    ///
+    /// Note: This returns a [SealedHeader] because it's expected that this is sealed by the
+    /// provider and the caller does not know the hash.
+    fn finalized_header(&self) -> Result<Option<SealedHeader>> {
+        self.sealed_header_by_id(BlockNumberOrTag::Finalized.into())
     }
 
     /// Returns the block with the matching `BlockId` from the database.

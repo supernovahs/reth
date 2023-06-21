@@ -11,15 +11,19 @@ use reth_interfaces::p2p::{
     headers::client::{HeadersClient, HeadersRequest},
     priority::Priority,
 };
-use reth_primitives::{BlockHashOrNumber, HeadersDirection, SealedHeader};
-use std::{path::Path, time::Duration};
+use reth_primitives::{BlockHashOrNumber, ChainSpec, HeadersDirection, SealedHeader};
+use std::{
+    env::VarError,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 use tracing::info;
 
 /// Get a single header from network
 pub async fn get_single_header<Client>(
     client: Client,
     id: BlockHashOrNumber,
-) -> eyre::Result<SealedHeader>
+) -> Result<SealedHeader>
 where
     Client: HeadersClient,
 {
@@ -55,12 +59,13 @@ where
 /// Wrapper over DB that implements many useful DB queries.
 pub struct DbTool<'a, DB: Database> {
     pub(crate) db: &'a DB,
+    pub(crate) chain: Arc<ChainSpec>,
 }
 
 impl<'a, DB: Database> DbTool<'a, DB> {
     /// Takes a DB where the tables have already been created.
-    pub(crate) fn new(db: &'a DB) -> eyre::Result<Self> {
-        Ok(Self { db })
+    pub(crate) fn new(db: &'a DB, chain: Arc<ChainSpec>) -> eyre::Result<Self> {
+        Ok(Self { db, chain })
     }
 
     /// Grabs the contents of the table within a certain index range and places the
@@ -92,7 +97,7 @@ impl<'a, DB: Database> DbTool<'a, DB> {
     /// Drops the database at the given path.
     pub fn drop(&mut self, path: impl AsRef<Path>) -> Result<()> {
         let path = path.as_ref();
-        info!(target: "reth::cli", "Dropping db at {:?}", path);
+        info!(target: "reth::cli", "Dropping database at {:?}", path);
         std::fs::remove_dir_all(path).wrap_err("Dropping the database failed")?;
         Ok(())
     }
@@ -104,8 +109,8 @@ impl<'a, DB: Database> DbTool<'a, DB> {
     }
 }
 
-/// Helper to parse a [Duration] from seconds
-pub fn parse_duration_from_secs(arg: &str) -> Result<Duration, std::num::ParseIntError> {
-    let seconds = arg.parse()?;
-    Ok(Duration::from_secs(seconds))
+/// Parses a user-specified path with support for environment variables and common shorthands (e.g.
+/// ~ for the user's home directory).
+pub fn parse_path(value: &str) -> Result<PathBuf, shellexpand::LookupError<VarError>> {
+    shellexpand::full(value).map(|path| PathBuf::from(path.into_owned()))
 }

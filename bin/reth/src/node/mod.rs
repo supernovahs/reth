@@ -12,7 +12,7 @@ use crate::{
 use clap::Parser;
 use eyre::Context;
 use fdlimit::raise_fd_limit;
-use futures::{pin_mut, stream::select as stream_select, StreamExt};
+use futures::{future::Either, pin_mut, stream, stream_select, StreamExt};
 use reth_auto_seal_consensus::{AutoSealBuilder, AutoSealConsensus};
 use reth_basic_payload_builder::{BasicPayloadJobGenerator, BasicPayloadJobGeneratorConfig};
 use reth_beacon_consensus::{BeaconConsensus, BeaconConsensusEngine};
@@ -23,8 +23,6 @@ use reth_config::Config;
 use reth_db::{
     database::Database,
     mdbx::{Env, WriteMap},
-    tables,
-    transaction::DbTx,
 };
 use reth_discv4::DEFAULT_DISCOVERY_PORT;
 use reth_downloaders::{
@@ -41,21 +39,15 @@ use reth_interfaces::{
 };
 use reth_network::{error::NetworkError, NetworkConfig, NetworkHandle, NetworkManager};
 use reth_network_api::NetworkInfo;
-use reth_primitives::{
-    stage::StageId, BlockHashOrNumber, ChainSpec, Head, Header, SealedHeader, H256,
-};
+use reth_primitives::{stage::StageId, BlockHashOrNumber, ChainSpec, Head, SealedHeader, H256};
 use reth_provider::{
-    providers::get_stage_checkpoint, BlockProvider, CanonStateSubscriptions, HeaderProvider,
-    ShareableDatabase,
+    BlockHashProvider, BlockProvider, CanonStateSubscriptions, HeaderProvider, ProviderFactory,
+    StageCheckpointReader,
 };
 use reth_revm::Factory;
 use reth_revm_inspectors::stack::Hook;
 use reth_rpc_engine_api::EngineApi;
-use reth_staged_sync::utils::{
-    chainspec::genesis_value_parser,
-    init::{init_db, init_genesis},
-    parse_socket_address,
-};
+use reth_staged_sync::utils::init::{init_db, init_genesis};
 use reth_stages::{
     prelude::*,
     stages::{
@@ -74,13 +66,23 @@ use std::{
 use tokio::sync::{mpsc::unbounded_channel, oneshot, watch};
 use tracing::*;
 
-use crate::{args::PayloadBuilderArgs, dirs::MaybePlatformPath};
+use crate::{
+    args::{
+        utils::{genesis_value_parser, parse_socket_address},
+        PayloadBuilderArgs,
+    },
+    dirs::MaybePlatformPath,
+    node::cl_events::ConsensusLayerHealthEvents,
+};
 use reth_interfaces::p2p::headers::client::HeadersClient;
 use reth_payload_builder::PayloadBuilderService;
-use reth_primitives::bytes::BytesMut;
 use reth_provider::providers::BlockchainProvider;
-use reth_rlp::Encodable;
+use reth_stages::stages::{
+    AccountHashingStage, IndexAccountHistoryStage, IndexStorageHistoryStage, MerkleStage,
+    StorageHashingStage, TransactionLookupStage,
+};
 
+pub mod cl_events;
 pub mod events;
 
 /// Start the node
@@ -197,8 +199,8 @@ impl Command {
         )?);
 
         // setup the blockchain provider
-        let shareable_db = ShareableDatabase::new(Arc::clone(&db), Arc::clone(&self.chain));
-        let blockchain_db = BlockchainProvider::new(shareable_db, blockchain_tree.clone())?;
+        let factory = ProviderFactory::new(Arc::clone(&db), Arc::clone(&self.chain));
+        let blockchain_db = BlockchainProvider::new(factory, blockchain_tree.clone())?;
 
         let transaction_pool = reth_transaction_pool::Pool::eth_pool(
             EthTransactionValidator::new(blockchain_db.clone(), Arc::clone(&self.chain)),
@@ -252,9 +254,6 @@ impl Command {
 
         let (consensus_engine_tx, consensus_engine_rx) = unbounded_channel();
 
-        // configure the payload builder
-        let mut extradata = BytesMut::new();
-        self.builder.extradata.as_bytes().encode(&mut extradata);
         let payload_generator = BasicPayloadJobGenerator::new(
             blockchain_db.clone(),
             transaction_pool.clone(),
@@ -263,7 +262,7 @@ impl Command {
                 .interval(self.builder.interval)
                 .deadline(self.builder.deadline)
                 .max_payload_tasks(self.builder.max_payload_tasks)
-                .extradata(extradata.freeze())
+                .extradata(self.builder.extradata_bytes())
                 .max_gas_limit(self.builder.max_gas_limit),
             Arc::clone(&self.chain),
         );
@@ -344,12 +343,18 @@ impl Command {
         )?;
         info!(target: "reth::cli", "Consensus engine initialized");
 
-        let events = stream_select(
-            stream_select(
-                network.event_listener().map(Into::into),
-                beacon_engine_handle.event_listener().map(Into::into),
-            ),
+        let events = stream_select!(
+            network.event_listener().map(Into::into),
+            beacon_engine_handle.event_listener().map(Into::into),
             pipeline_events.map(Into::into),
+            if self.debug.tip.is_none() {
+                Either::Left(
+                    ConsensusLayerHealthEvents::new(Box::new(blockchain_db.clone()))
+                        .map(Into::into),
+                )
+            } else {
+                Either::Right(stream::empty())
+            }
         );
         ctx.task_executor
             .spawn_critical("events task", events::handle_events(Some(network.clone()), events));
@@ -504,30 +509,31 @@ impl Command {
         Ok(handle)
     }
 
-    fn lookup_head(
-        &self,
-        db: Arc<Env<WriteMap>>,
-    ) -> Result<Head, reth_interfaces::db::DatabaseError> {
-        db.view(|tx| {
-            let head = get_stage_checkpoint(tx, StageId::Finish)?.unwrap_or_default().block_number;
-            let header = tx
-                .get::<tables::Headers>(head)?
-                .expect("the header for the latest block is missing, database is corrupt");
-            let total_difficulty = tx.get::<tables::HeaderTD>(head)?.expect(
-                "the total difficulty for the latest block is missing, database is corrupt",
-            );
-            let hash = tx
-                .get::<tables::CanonicalHeaders>(head)?
-                .expect("the hash for the latest block is missing, database is corrupt");
-            Ok::<Head, reth_interfaces::db::DatabaseError>(Head {
-                number: head,
-                hash,
-                difficulty: header.difficulty,
-                total_difficulty: total_difficulty.into(),
-                timestamp: header.timestamp,
-            })
-        })?
-        .map_err(Into::into)
+    fn lookup_head(&self, db: Arc<Env<WriteMap>>) -> Result<Head, reth_interfaces::Error> {
+        let factory = ProviderFactory::new(db, self.chain.clone());
+        let provider = factory.provider()?;
+
+        let head = provider.get_stage_checkpoint(StageId::Finish)?.unwrap_or_default().block_number;
+
+        let header = provider
+            .header_by_number(head)?
+            .expect("the header for the latest block is missing, database is corrupt");
+
+        let total_difficulty = provider
+            .header_td_by_number(head)?
+            .expect("the total difficulty for the latest block is missing, database is corrupt");
+
+        let hash = provider
+            .block_hash(head)?
+            .expect("the hash for the latest block is missing, database is corrupt");
+
+        Ok(Head {
+            number: head,
+            hash,
+            difficulty: header.difficulty,
+            total_difficulty,
+            timestamp: header.timestamp,
+        })
     }
 
     /// Attempt to look up the block number for the tip hash in the database.
@@ -560,13 +566,10 @@ impl Command {
         DB: Database,
         Client: HeadersClient,
     {
-        let header = db.view(|tx| -> Result<Option<Header>, reth_db::DatabaseError> {
-            let number = match tip {
-                BlockHashOrNumber::Hash(hash) => tx.get::<tables::HeaderNumbers>(hash)?,
-                BlockHashOrNumber::Number(number) => Some(number),
-            };
-            Ok(number.map(|number| tx.get::<tables::Headers>(number)).transpose()?.flatten())
-        })??;
+        let factory = ProviderFactory::new(db, self.chain.clone());
+        let provider = factory.provider()?;
+
+        let header = provider.header_by_hash_or_number(tip)?;
 
         // try to look up the header in the database
         if let Some(header) = header {
@@ -595,7 +598,7 @@ impl Command {
         executor: TaskExecutor,
         secret_key: SecretKey,
         default_peers_path: PathBuf,
-    ) -> NetworkConfig<ShareableDatabase<Arc<Env<WriteMap>>>> {
+    ) -> NetworkConfig<ProviderFactory<Arc<Env<WriteMap>>>> {
         let head = self.lookup_head(Arc::clone(&db)).expect("the head block is missing");
 
         self.network
@@ -610,7 +613,7 @@ impl Command {
                 Ipv4Addr::UNSPECIFIED,
                 self.network.discovery.port.unwrap_or(DEFAULT_DISCOVERY_PORT),
             )))
-            .build(ShareableDatabase::new(db, self.chain.clone()))
+            .build(ProviderFactory::new(db, self.chain.clone()))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -629,7 +632,7 @@ impl Command {
         H: HeaderDownloader + 'static,
         B: BodyDownloader + 'static,
     {
-        let stage_conf = &config.stages;
+        let stage_config = &config.stages;
 
         let mut builder = Pipeline::builder();
 
@@ -671,23 +674,36 @@ impl Command {
                 )
                 .set(
                     TotalDifficultyStage::new(consensus)
-                        .with_commit_threshold(stage_conf.total_difficulty.commit_threshold),
+                        .with_commit_threshold(stage_config.total_difficulty.commit_threshold),
                 )
                 .set(SenderRecoveryStage {
-                    commit_threshold: stage_conf.sender_recovery.commit_threshold,
+                    commit_threshold: stage_config.sender_recovery.commit_threshold,
                 })
                 .set(ExecutionStage::new(
                     factory,
                     ExecutionStageThresholds {
-                        max_blocks: stage_conf.execution.max_blocks,
-                        max_changes: stage_conf.execution.max_changes,
-                        max_changesets: stage_conf.execution.max_changesets,
+                        max_blocks: stage_config.execution.max_blocks,
+                        max_changes: stage_config.execution.max_changes,
                     },
                 ))
-                .disable_if(StageId::MerkleUnwind, || self.auto_mine)
-                .disable_if(StageId::MerkleExecute, || self.auto_mine),
+                .set(AccountHashingStage::new(
+                    stage_config.account_hashing.clean_threshold,
+                    stage_config.account_hashing.commit_threshold,
+                ))
+                .set(StorageHashingStage::new(
+                    stage_config.storage_hashing.clean_threshold,
+                    stage_config.storage_hashing.commit_threshold,
+                ))
+                .set(MerkleStage::new_execution(stage_config.merkle.clean_threshold))
+                .set(TransactionLookupStage::new(stage_config.transaction_lookup.commit_threshold))
+                .set(IndexAccountHistoryStage::new(
+                    stage_config.index_account_history.commit_threshold,
+                ))
+                .set(IndexStorageHistoryStage::new(
+                    stage_config.index_storage_history.commit_threshold,
+                )),
             )
-            .build(db);
+            .build(db, self.chain.clone());
 
         Ok(pipeline)
     }
