@@ -1,5 +1,5 @@
 use super::AccountProvider;
-use crate::{post_state::PostState, BlockHashProvider, BlockIdProvider};
+use crate::{change::BundleState, post_state::PostState, BlockHashProvider, BlockIdProvider};
 use auto_impl::auto_impl;
 use reth_interfaces::{provider::ProviderError, Result};
 use reth_primitives::{
@@ -209,7 +209,7 @@ pub trait BlockchainTreePendingStateProvider: Send + Sync {
 #[auto_impl[Box,&]]
 pub trait PostStateDataProvider: Send + Sync {
     /// Return post state
-    fn state(&self) -> &PostState;
+    fn state(&self) -> &BundleState;
     /// Return block hash by block number of pending or canonical chain.
     fn block_hash(&self, block_number: BlockNumber) -> Option<BlockHash>;
     /// return canonical fork, the block on what post state was forked from.
@@ -222,5 +222,5 @@ pub trait PostStateDataProvider: Send + Sync {
 #[auto_impl[Box,&, Arc]]
 pub trait StateRootProvider: Send + Sync {
     /// Returns the state root of the PostState on top of the current state.
-    fn state_root(&self, post_state: PostState) -> Result<H256>;
+    fn state_root(&self, post_state: BundleState) -> Result<H256>;
 }

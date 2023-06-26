@@ -11,6 +11,7 @@ use crate::{
     EthApi, EthApiSpec,
 };
 use async_trait::async_trait;
+use reth_interfaces::Error;
 use reth_network_api::NetworkInfo;
 use reth_primitives::{
     Address, BlockId, BlockNumberOrTag, Bytes, FromRecoveredTransaction, Header,
@@ -20,8 +21,9 @@ use reth_primitives::{
 };
 use reth_provider::{BlockProviderIdExt, EvmEnvProvider, StateProviderBox, StateProviderFactory};
 use reth_revm::{
-    database::{State, SubState},
+    database::State,
     env::{fill_block_env_with_coinbase, tx_env_with_recovered},
+    revm::State as RevmState,
     tracing::{TracingInspector, TracingInspectorConfig},
 };
 use reth_rpc_types::{
@@ -37,7 +39,7 @@ use revm::{
 use revm_primitives::{utilities::create_address, Env, ResultAndState, SpecId};
 
 /// Helper alias type for the state's [CacheDB]
-pub(crate) type StateCacheDB<'r> = CacheDB<State<StateProviderBox<'r>>>;
+pub(crate) type StateCacheDB<'r> = RevmState<'r, Error>;
 
 /// Commonly used transaction related functions for the [EthApi] type in the `eth_` namespace
 #[async_trait::async_trait]
@@ -263,7 +265,7 @@ where
             let mut block_env = BlockEnv::default();
             self.provider().fill_block_env_with_header(&mut block_env, &header)?;
             self.provider().fill_cfg_env_with_header(&mut cfg, &header)?;
-            return Ok((cfg, block_env, header.hash.into()))
+            return Ok((cfg, block_env, header.hash.into()));
         } else {
             //  Use cached values if there is no pending block
             let block_hash = self
@@ -500,9 +502,10 @@ where
     {
         let (cfg, block_env, at) = self.evm_env_at(at).await?;
         let state = self.state_at(at)?;
-        let mut db = SubState::new(State::new(state));
+        let mut db = RevmState::new_without_transitions(Box::new(State::new(state)));
 
-        let env = prepare_call_env(cfg, block_env, request, &mut db, overrides)?;
+        let env =
+            prepare_call_env::<StateCacheDB<'_>>(cfg, block_env, request, &mut db, overrides)?;
         f(db, env)
     }
 
@@ -540,9 +543,10 @@ where
     {
         let (cfg, block_env, at) = self.evm_env_at(at).await?;
         let state = self.state_at(at)?;
-        let mut db = SubState::new(State::new(state));
+        let mut db = RevmState::new_without_transitions(Box::new(State::new(state)));
 
-        let env = prepare_call_env(cfg, block_env, request, &mut db, overrides)?;
+        let env =
+            prepare_call_env::<StateCacheDB<'_>>(cfg, block_env, request, &mut db, overrides)?;
         inspect_and_return_db(db, env, inspector)
     }
 
@@ -557,7 +561,7 @@ where
         F: FnOnce(TracingInspector, ResultAndState) -> EthResult<R>,
     {
         self.with_state_at_block(at, |state| {
-            let db = SubState::new(State::new(state));
+            let db = RevmState::new_without_transitions(Box::new(State::new(state)));
 
             let mut inspector = TracingInspector::new(config);
             let (res, _) = inspect(db, env, &mut inspector)?;
@@ -577,7 +581,7 @@ where
         F: for<'a> FnOnce(TracingInspector, ResultAndState, StateCacheDB<'a>) -> EthResult<R>,
     {
         self.with_state_at_block(at, |state| {
-            let db = SubState::new(State::new(state));
+            let db = RevmState::new_without_transitions(Box::new(State::new(state)));
             let mut inspector = TracingInspector::new(config);
             let (res, _, db) = inspect_and_return_db(db, env, &mut inspector)?;
 
@@ -632,10 +636,10 @@ where
         let block_txs = block.body;
 
         self.with_state_at_block(parent_block.into(), |state| {
-            let mut db = SubState::new(State::new(state));
+            let mut db = RevmState::new_without_transitions(Box::new(State::new(state)));
 
             // replay all transactions prior to the targeted transaction
-            replay_transactions_until(&mut db, cfg.clone(), block_env.clone(), block_txs, tx.hash)?;
+            replay_transactions_until::<StateCacheDB<'_>,_,_>(&mut db, cfg.clone(), block_env.clone(), block_txs, tx.hash)?;
 
             let env = Env { cfg, block: block_env, tx: tx_env_with_recovered(&tx) };
 
@@ -665,7 +669,7 @@ where
                 return match signer.sign_transaction(request, from) {
                     Ok(tx) => Ok(tx),
                     Err(e) => Err(e.into()),
-                }
+                };
             }
         }
         Err(EthApiError::InvalidTransactionSignature)
@@ -693,7 +697,7 @@ where
                     block.header.number,
                     block.header.base_fee_per_gas,
                     index.into(),
-                )))
+                )));
             }
         }
 

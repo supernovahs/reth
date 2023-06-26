@@ -10,7 +10,7 @@ use reth_rpc_types::{
     BlockOverrides, CallRequest,
 };
 use revm::{
-    db::CacheDB,
+    db::State as RevmState,
     precompile::{Precompiles, SpecId as PrecompilesSpecId},
     primitives::{BlockEnv, CfgEnv, Env, ResultAndState, SpecId, TransactTo, TxEnv},
     Database, Inspector,
@@ -162,15 +162,15 @@ where
 ///
 /// Note: This assumes the target transaction is in the given iterator.
 pub(crate) fn replay_transactions_until<DB, I, Tx>(
-    db: &mut CacheDB<DB>,
+    db: &mut RevmState<'_, DB::Error>,
     cfg: CfgEnv,
     block_env: BlockEnv,
     transactions: I,
     target_tx_hash: H256,
 ) -> EthResult<()>
 where
-    DB: DatabaseRef,
-    EthApiError: From<<DB as DatabaseRef>::Error>,
+    DB: Database,
+    EthApiError: From<<DB as Database>::Error>,
     I: IntoIterator<Item = Tx>,
     Tx: FillableTransaction,
 {
@@ -197,12 +197,12 @@ pub(crate) fn prepare_call_env<DB>(
     mut cfg: CfgEnv,
     block: BlockEnv,
     request: CallRequest,
-    db: &mut CacheDB<DB>,
+    db: &mut RevmState<'_, DB::Error>,
     overrides: EvmOverrides,
 ) -> EthResult<Env>
 where
-    DB: DatabaseRef,
-    EthApiError: From<<DB as DatabaseRef>::Error>,
+    DB: Database,
+    EthApiError: From<DB::Error>,
 {
     // we want to disable this in eth_call, since this is common practice used by other node
     // impls and providers <https://github.com/foundry-rs/foundry/issues/4388>
@@ -223,7 +223,7 @@ where
 
     // apply state overrides
     if let Some(state_overrides) = overrides.state {
-        apply_state_overrides(state_overrides, db)?;
+        apply_state_overrides::<DB>(state_overrides, db)?;
     }
 
     // apply block overrides
@@ -411,13 +411,16 @@ fn apply_block_overrides(overrides: BlockOverrides, env: &mut BlockEnv) {
 }
 
 /// Applies the given state overrides (a set of [AccountOverride]) to the [CacheDB].
-fn apply_state_overrides<DB>(overrides: StateOverride, db: &mut CacheDB<DB>) -> EthResult<()>
+fn apply_state_overrides<DB>(
+    overrides: StateOverride,
+    db: &mut RevmState<'_, DB::Error>,
+) -> EthResult<()>
 where
-    DB: DatabaseRef,
-    EthApiError: From<<DB as DatabaseRef>::Error>,
+    DB: Database,
+    EthApiError: From<DB::Error>,
 {
     for (account, account_overrides) in overrides {
-        apply_account_override(account, account_overrides, db)?;
+        apply_account_override::<DB>(account, account_overrides, db)?;
     }
     Ok(())
 }
@@ -426,12 +429,14 @@ where
 fn apply_account_override<DB>(
     account: Address,
     account_override: AccountOverride,
-    db: &mut CacheDB<DB>,
+    db: &mut RevmState<'_, DB::Error>,
 ) -> EthResult<()>
 where
-    DB: DatabaseRef,
-    EthApiError: From<<DB as DatabaseRef>::Error>,
+    DB: Database,
+    EthApiError: From<DB::Error>,
 {
+    // TODO rakita
+    /*
     let mut account_info = db.basic(account)?.unwrap_or_default();
 
     if let Some(nonce) = account_override.nonce {
@@ -475,6 +480,7 @@ where
             }
         }
     };
+    */
 
     Ok(())
 }

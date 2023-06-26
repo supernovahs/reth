@@ -6,12 +6,15 @@ use crate::{
     stack::{InspectorStack, InspectorStackConfig},
     state_change::post_block_balance_increments,
 };
-use reth_interfaces::{executor::BlockExecutionError, Error};
+use reth_interfaces::{
+    executor::{BlockExecutionError, BlockValidationError},
+    Error,
+};
 use reth_primitives::{
     Address, Block, BlockNumber, Bloom, ChainSpec, Hardfork, Header, Receipt, ReceiptWithBloom,
     TransactionSigned, H256, U256,
 };
-use reth_provider::{change::StateReverts, BlockExecutor, PostState, StateChange, StateProvider};
+use reth_provider::{change::BundleState, BlockExecutor, StateProvider};
 use revm::{primitives::ResultAndState, DatabaseCommit, State as RevmState, EVM};
 use std::sync::Arc;
 use tracing::debug;
@@ -22,7 +25,10 @@ pub struct NewExecutor<'a> {
     pub chain_spec: Arc<ChainSpec>,
     evm: EVM<RevmState<'a, Error>>,
     stack: InspectorStack,
-    receipts: Vec<(BlockNumber, Vec<Receipt>)>,
+    receipts: Vec<Vec<Receipt>>,
+    /// First block will be initialized to ZERO
+    /// and be set to the block number of first block executed.
+    first_block: BlockNumber,
 }
 
 impl<'a> From<Arc<ChainSpec>> for NewExecutor<'a> {
@@ -35,6 +41,7 @@ impl<'a> From<Arc<ChainSpec>> for NewExecutor<'a> {
             evm,
             stack: InspectorStack::new(InspectorStackConfig::default()),
             receipts: Vec::new(),
+            first_block: 0,
         }
     }
 }
@@ -43,7 +50,7 @@ impl<'a> NewExecutor<'a> {
     /// Creates a new executor from the given chain spec and database.
     pub fn new<DB: StateProvider + 'a>(chain_spec: Arc<ChainSpec>, db: State<DB>) -> Self {
         let mut evm = EVM::new();
-        let revm_state = RevmState::new_with_transtion(Box::new(db));
+        let revm_state = RevmState::new_with_transition(Box::new(db));
         evm.database(revm_state);
 
         NewExecutor {
@@ -51,6 +58,7 @@ impl<'a> NewExecutor<'a> {
             evm,
             stack: InspectorStack::new(InspectorStackConfig::default()),
             receipts: Vec::new(),
+            first_block: 0,
         }
     }
 
@@ -73,11 +81,13 @@ impl<'a> NewExecutor<'a> {
             if body.len() == senders.len() {
                 Ok(senders)
             } else {
-                Err(BlockExecutionError::SenderRecoveryError)
+                Err(BlockValidationError::SenderRecoveryError.into())
             }
         } else {
             body.iter()
-                .map(|tx| tx.recover_signer().ok_or(BlockExecutionError::SenderRecoveryError))
+                .map(|tx| {
+                    tx.recover_signer().ok_or(BlockValidationError::SenderRecoveryError.into())
+                })
                 .collect()
         }
     }
@@ -95,7 +105,7 @@ impl<'a> NewExecutor<'a> {
 
     /// Post execution state change that include block reward, withdrawals and iregular DAO hardfork
     /// state change.
-    fn post_execution_state_change(
+    pub fn post_execution_state_change(
         &mut self,
         block: &Block,
         total_difficulty: U256,
@@ -117,7 +127,7 @@ impl<'a> NewExecutor<'a> {
             let drained_balance: u128 = self
                 .db()
                 .drain_balances(DAO_HARDKFORK_ACCOUNTS.into_iter())
-                .map_err(|_| BlockExecutionError::IncrementBalanceFailed)?
+                .map_err(|_| BlockValidationError::IncrementBalanceFailed)?
                 .into_iter()
                 .sum();
 
@@ -131,7 +141,7 @@ impl<'a> NewExecutor<'a> {
             .increment_balances(
                 balance_increments.into_iter().map(|(k, v)| (k, v.try_into().unwrap())),
             )
-            .map_err(|_| BlockExecutionError::IncrementBalanceFailed)?;
+            .map_err(|_| BlockValidationError::IncrementBalanceFailed)?;
 
         Ok(())
     }
@@ -162,7 +172,7 @@ impl<'a> NewExecutor<'a> {
             // main execution.
             self.evm.transact()
         };
-        out.map_err(|e| BlockExecutionError::EVM { hash, message: format!("{e:?}") })
+        out.map_err(|e| BlockValidationError::EVM { hash, message: format!("{e:?}") }.into())
     }
 
     /// Runs the provided transactions and commits their state to the run-time database.
@@ -183,7 +193,7 @@ impl<'a> NewExecutor<'a> {
     ) -> Result<u64, BlockExecutionError> {
         // perf: do not execute empty blocks
         if block.body.is_empty() {
-            self.receipts.push((block.number, Vec::new()));
+            self.receipts.push(Vec::new());
             return Ok(0)
         }
         let senders = self.recover_senders(&block.body, senders)?;
@@ -197,10 +207,11 @@ impl<'a> NewExecutor<'a> {
             // must be no greater than the block’s gasLimit.
             let block_available_gas = block.header.gas_limit - cumulative_gas_used;
             if transaction.gas_limit() > block_available_gas {
-                return Err(BlockExecutionError::TransactionGasLimitMoreThanAvailableBlockGas {
+                return Err(BlockValidationError::TransactionGasLimitMoreThanAvailableBlockGas {
                     transaction_gas_limit: transaction.gas_limit(),
                     block_available_gas,
-                })
+                }
+                .into())
             }
             // Execute transaction.
             let ResultAndState { result, state } = self.transact(transaction, sender)?;
@@ -223,35 +234,38 @@ impl<'a> NewExecutor<'a> {
                 logs: result.into_logs().into_iter().map(into_reth_log).collect(),
             });
         }
-        //println!("    {} RECEIPTS:{receipts:?}",block.number);
-        self.receipts.push((block.number, receipts));
+        self.receipts.push(receipts);
 
         Ok(cumulative_gas_used)
     }
 }
 
-impl<'a, SP: StateProvider> BlockExecutor<SP> for NewExecutor<'a> {
+impl<'a> BlockExecutor for NewExecutor<'a> {
     fn execute(
         &mut self,
         block: &Block,
         total_difficulty: U256,
         senders: Option<Vec<Address>>,
-    ) -> Result<PostState, BlockExecutionError> {
+    ) -> Result<(), BlockExecutionError> {
         let cumulative_gas_used = self.execute_transactions(block, total_difficulty, senders)?;
 
         // Check if gas used matches the value set in header.
         if block.gas_used != cumulative_gas_used {
-            return Err(BlockExecutionError::BlockGasUsed {
+            return Err(BlockValidationError::BlockGasUsed {
                 got: cumulative_gas_used,
                 expected: block.gas_used,
-            })
+            }
+            .into())
         }
 
         self.post_execution_state_change(block, total_difficulty)?;
 
         self.db().merge_transitions();
-        // TODO remove PostState
-        Ok(PostState::default())
+
+        if self.first_block == 0 {
+            self.first_block = block.number;
+        }
+        Ok(())
     }
 
     fn execute_and_verify_receipt(
@@ -259,13 +273,9 @@ impl<'a, SP: StateProvider> BlockExecutor<SP> for NewExecutor<'a> {
         block: &Block,
         total_difficulty: U256,
         senders: Option<Vec<Address>>,
-    ) -> Result<PostState, BlockExecutionError> {
-        let post_state = <NewExecutor<'a> as BlockExecutor<SP>>::execute(
-            self,
-            block,
-            total_difficulty,
-            senders,
-        )?;
+    ) -> Result<(), BlockExecutionError> {
+        // execute block
+        self.execute(block, total_difficulty, senders)?;
 
         // TODO Before Byzantium, receipts contained state root that would mean that expensive
         // operation as hashing that is needed for state root got calculated in every
@@ -275,7 +285,7 @@ impl<'a, SP: StateProvider> BlockExecutor<SP> for NewExecutor<'a> {
             if let Err(e) = verify_receipt(
                 block.header.receipts_root,
                 block.header.logs_bloom,
-                self.receipts.last().unwrap().1.iter(),
+                self.receipts.last().unwrap().iter(),
             ) {
                 debug!(
                     target = "sync",
@@ -287,16 +297,12 @@ impl<'a, SP: StateProvider> BlockExecutor<SP> for NewExecutor<'a> {
             };
         }
 
-        Ok(post_state)
+        Ok(())
     }
 
-    fn take_receipts(&mut self) -> Vec<(BlockNumber, Vec<Receipt>)> {
-        std::mem::take(&mut self.receipts)
-    }
-
-    fn take_changes_and_reverts(&mut self) -> (StateChange, StateReverts) {
-        let mut bundle = self.evm.db().unwrap().take_bundle();
-        (bundle.take_sorted_plain_change().into(), bundle.take_reverts().into())
+    fn take_output_state(&mut self) -> BundleState {
+        let receipts = std::mem::take(&mut self.receipts);
+        BundleState::new(self.evm.db().unwrap().take_bundle(), receipts, self.first_block)
     }
 }
 
@@ -310,19 +316,21 @@ pub fn verify_receipt<'a>(
     let receipts_with_bloom = receipts.map(|r| r.clone().into()).collect::<Vec<ReceiptWithBloom>>();
     let receipts_root = reth_primitives::proofs::calculate_receipt_root(&receipts_with_bloom);
     if receipts_root != expected_receipts_root {
-        return Err(BlockExecutionError::ReceiptRootDiff {
+        return Err(BlockValidationError::ReceiptRootDiff {
             got: receipts_root,
             expected: expected_receipts_root,
-        })
+        }
+        .into())
     }
 
     // Create header log bloom.
     let logs_bloom = receipts_with_bloom.iter().fold(Bloom::zero(), |bloom, r| bloom | r.bloom);
     if logs_bloom != expected_logs_bloom {
-        return Err(BlockExecutionError::BloomLogDiff {
+        return Err(BlockValidationError::BloomLogDiff {
             expected: Box::new(expected_logs_bloom),
             got: Box::new(logs_bloom),
-        })
+        }
+        .into())
     }
 
     Ok(())

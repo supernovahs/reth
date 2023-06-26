@@ -1,33 +1,22 @@
 //! Executor Factory
 
-use crate::{change::StateReverts, post_state::PostState, StateChange, StateProvider};
+use crate::{change::BundleState, StateProvider};
 use reth_interfaces::executor::BlockExecutionError;
-use reth_primitives::{Address, Block, BlockNumber, ChainSpec, Receipt, U256};
+use reth_primitives::{Address, Block, ChainSpec, U256};
 
 /// Executor factory that would create the EVM with particular state provider.
 ///
 /// It can be used to mock executor.
 pub trait ExecutorFactory: Send + Sync + 'static {
-    /// The executor produced by the factory
-    type Executor<T: StateProvider>: BlockExecutor<T>;
-
     /// Executor with [`StateProvider`]
-    fn with_sp<SP: StateProvider>(&self, sp: SP) -> Self::Executor<SP>;
-
-    /// TODO REWORK only for integration tests.
-    fn revm_state_with_sp<'a, SP: StateProvider + 'a>(
-        &'a self,
-        _sp: SP,
-    ) -> Option<Box<dyn BlockExecutor<SP> + 'a>> {
-        None
-    }
+    fn with_sp<'a, SP: StateProvider + 'a>(&'a self, _sp: SP) -> Box<dyn BlockExecutor + 'a>;
 
     /// Return internal chainspec
     fn chain_spec(&self) -> &ChainSpec;
 }
 
 /// An executor capable of executing a block.
-pub trait BlockExecutor<SP: StateProvider> {
+pub trait BlockExecutor {
     /// Execute a block.
     ///
     /// The number of `senders` should be equal to the number of transactions in the block.
@@ -41,7 +30,7 @@ pub trait BlockExecutor<SP: StateProvider> {
         block: &Block,
         total_difficulty: U256,
         senders: Option<Vec<Address>>,
-    ) -> Result<PostState, BlockExecutionError>;
+    ) -> Result<(), BlockExecutionError>;
 
     /// Executes the block and checks receipts
     fn execute_and_verify_receipt(
@@ -49,16 +38,8 @@ pub trait BlockExecutor<SP: StateProvider> {
         block: &Block,
         total_difficulty: U256,
         senders: Option<Vec<Address>>,
-    ) -> Result<PostState, BlockExecutionError>;
+    ) -> Result<(), BlockExecutionError>;
 
-    /// TEMPORARY return post state after execution multiple blocks.
-    /// Idea is to hide multi block execution.
-    fn take_changes_and_reverts(&mut self) -> (StateChange, StateReverts) {
-        panic!("Not implemented");
-    }
-
-    /// TODO Temporary return receipts after execution of multiple blocks
-    fn take_receipts(&mut self) -> Vec<(BlockNumber, Vec<Receipt>)> {
-        panic!("Not implemented");
-    }
+    /// Return bundle state. This is output of the execution.
+    fn take_output_state(&mut self) -> BundleState;
 }

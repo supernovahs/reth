@@ -15,15 +15,13 @@ use ethers_core::utils::get_contract_address;
 use reth_network_api::NetworkInfo;
 use reth_primitives::{AccessList, BlockId, BlockNumberOrTag, Bytes, U256};
 use reth_provider::{BlockProviderIdExt, EvmEnvProvider, StateProvider, StateProviderFactory};
-use reth_revm::{
-    access_list::AccessListInspector,
-    database::{State, SubState},
-};
+use reth_revm::{access_list::AccessListInspector, database::State, revm::State as RevmState};
 use reth_rpc_types::CallRequest;
 use reth_transaction_pool::TransactionPool;
 use revm::{
     db::{CacheDB, DatabaseRef},
     primitives::{BlockEnv, CfgEnv, Env, ExecutionResult, Halt, TransactTo},
+    Database,
 };
 use tracing::trace;
 
@@ -99,27 +97,28 @@ where
 
         // Configure the evm env
         let mut env = build_call_evm_env(cfg, block, request)?;
-        let mut db = SubState::new(State::new(state));
+        let mut db = RevmState::new_without_transitions(Box::new(State::new(state)));
 
         // if the request is a simple transfer we can optimize
-        if env.tx.data.is_empty() {
-            if let TransactTo::Call(to) = env.tx.transact_to {
-                if let Ok(code) = db.db.state().account_code(to) {
-                    let no_code_callee = code.map(|code| code.is_empty()).unwrap_or(true);
-                    if no_code_callee {
-                        // simple transfer, check if caller has sufficient funds
-                        let available_funds =
-                            db.basic(env.tx.caller)?.map(|acc| acc.balance).unwrap_or_default();
-                        if env.tx.value > available_funds {
-                            return Err(
-                                RpcInvalidTransactionError::InsufficientFundsForTransfer.into()
-                            )
-                        }
-                        return Ok(U256::from(MIN_TRANSACTION_GAS))
-                    }
-                }
-            }
-        }
+        // TODO(rakita) revm state
+        // if env.tx.data.is_empty() {
+        //     if let TransactTo::Call(to) = env.tx.transact_to {
+        //         if let Ok(code) = db.db.state().account_code(to) {
+        //             let no_code_callee = code.map(|code| code.is_empty()).unwrap_or(true);
+        //             if no_code_callee {
+        //                 // simple transfer, check if caller has sufficient funds
+        //                 let available_funds =
+        //                     db.basic(env.tx.caller)?.map(|acc| acc.balance).unwrap_or_default();
+        //                 if env.tx.value > available_funds {
+        //                     return Err(
+        //                         RpcInvalidTransactionError::InsufficientFundsForTransfer.into()
+        //                     );
+        //                 }
+        //                 return Ok(U256::from(MIN_TRANSACTION_GAS));
+        //             }
+        //         }
+        //     }
+        // }
 
         // check funds of the sender
         let gas_price = env.tx.gas_price;
@@ -127,7 +126,7 @@ where
             let mut available_funds =
                 db.basic(env.tx.caller)?.map(|acc| acc.balance).unwrap_or_default();
             if env.tx.value > available_funds {
-                return Err(RpcInvalidTransactionError::InsufficientFunds.into())
+                return Err(RpcInvalidTransactionError::InsufficientFunds.into());
             }
             // subtract transferred value from available funds
             // SAFETY: value < available_funds, checked above
@@ -158,7 +157,7 @@ where
             // if price or limit was included in the request then we can execute the request
             // again with the block's gas limit to check if revert is gas related or not
             if request_gas.is_some() || request_gas_price.is_some() {
-                return Err(map_out_of_gas_err(env_gas_limit, env, &mut db))
+                return Err(map_out_of_gas_err::<S>(env_gas_limit, env, &mut db));
             }
         }
 
@@ -174,11 +173,11 @@ where
                 // if price or limit was included in the request then we can execute the request
                 // again with the block's gas limit to check if revert is gas related or not
                 return if request_gas.is_some() || request_gas_price.is_some() {
-                    Err(map_out_of_gas_err(env_gas_limit, env, &mut db))
+                    Err(map_out_of_gas_err::<S>(env_gas_limit, env, &mut db))
                 } else {
                     // the transaction did revert
                     Err(RpcInvalidTransactionError::Revert(RevertError::new(output)).into())
-                }
+                };
             }
         }
 
@@ -215,7 +214,7 @@ where
 
                 // new midpoint
                 mid_gas_limit = ((highest_gas_limit as u128 + lowest_gas_limit as u128) / 2) as u64;
-                continue
+                continue;
             }
 
             let (res, _) = ethres?;
@@ -237,7 +236,7 @@ where
                         err => {
                             // these should be unreachable because we know the transaction succeeds,
                             // but we consider these cases an error
-                            return Err(RpcInvalidTransactionError::EvmHalt(err).into())
+                            return Err(RpcInvalidTransactionError::EvmHalt(err).into());
                         }
                     }
                 }
@@ -269,7 +268,7 @@ where
         // <https://github.com/ethereum/go-ethereum/blob/8990c92aea01ca07801597b00c0d83d4e2d9b811/internal/ethapi/api.go#L1476-L1476>
         env.cfg.disable_base_fee = true;
 
-        let mut db = SubState::new(State::new(state));
+        let mut db = RevmState::new_without_transitions(Box::new(State::new(state)));
 
         if request.gas.is_none() && env.tx.gas_price > U256::ZERO {
             // no gas limit was provided in the request, so we need to cap the request's gas limit
@@ -310,7 +309,7 @@ where
 fn map_out_of_gas_err<S>(
     env_gas_limit: U256,
     mut env: Env,
-    mut db: &mut CacheDB<State<S>>,
+    mut db: &mut RevmState<'_, <State<S> as Database>::Error>,
 ) -> EthApiError
 where
     S: StateProvider,

@@ -1,19 +1,22 @@
-use crate::{post_state::PostState, BlockExecutor, ExecutorFactory, StateProvider};
+use crate::{change::BundleState, BlockExecutor, ExecutorFactory, StateProvider};
 use parking_lot::Mutex;
 use reth_interfaces::executor::BlockExecutionError;
 use reth_primitives::{Address, Block, ChainSpec, U256};
 use std::sync::Arc;
 /// Test executor with mocked result.
-pub struct TestExecutor(pub Option<PostState>);
+pub struct TestExecutor(pub Option<BundleState>);
 
-impl<SP: StateProvider> BlockExecutor<SP> for TestExecutor {
+impl BlockExecutor for TestExecutor {
     fn execute(
         &mut self,
         _block: &Block,
         _total_difficulty: U256,
         _senders: Option<Vec<Address>>,
-    ) -> Result<PostState, BlockExecutionError> {
-        self.0.clone().ok_or(BlockExecutionError::UnavailableForTest)
+    ) -> Result<(), BlockExecutionError> {
+        if self.0.is_none() {
+            return Err(BlockExecutionError::UnavailableForTest)
+        }
+        Ok(())
     }
 
     fn execute_and_verify_receipt(
@@ -21,15 +24,22 @@ impl<SP: StateProvider> BlockExecutor<SP> for TestExecutor {
         _block: &Block,
         _total_difficulty: U256,
         _senders: Option<Vec<Address>>,
-    ) -> Result<PostState, BlockExecutionError> {
-        self.0.clone().ok_or(BlockExecutionError::UnavailableForTest)
+    ) -> Result<(), BlockExecutionError> {
+        if self.0.is_none() {
+            return Err(BlockExecutionError::UnavailableForTest)
+        }
+        Ok(())
+    }
+
+    fn take_output_state(&mut self) -> BundleState {
+        self.0.clone().unwrap_or_default()
     }
 }
 
 /// Executor factory with pre-set execution results.
 #[derive(Clone, Debug)]
 pub struct TestExecutorFactory {
-    exec_results: Arc<Mutex<Vec<PostState>>>,
+    exec_results: Arc<Mutex<Vec<BundleState>>>,
     chain_spec: Arc<ChainSpec>,
 }
 
@@ -40,17 +50,15 @@ impl TestExecutorFactory {
     }
 
     /// Extend the mocked execution results
-    pub fn extend(&self, results: Vec<PostState>) {
+    pub fn extend(&self, results: Vec<BundleState>) {
         self.exec_results.lock().extend(results.into_iter());
     }
 }
 
 impl ExecutorFactory for TestExecutorFactory {
-    type Executor<T: StateProvider> = TestExecutor;
-
-    fn with_sp<SP: StateProvider>(&self, _sp: SP) -> Self::Executor<SP> {
+    fn with_sp<'a, SP: StateProvider + 'a>(&'a self, _sp: SP) -> Box<dyn BlockExecutor + 'a> {
         let exec_res = self.exec_results.lock().pop();
-        TestExecutor(exec_res)
+        Box::new(TestExecutor(exec_res))
     }
 
     fn chain_spec(&self) -> &ChainSpec {

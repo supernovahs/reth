@@ -334,7 +334,7 @@ where
         if self.config.record_steps {
             self.gas_inspector.step_end(interp, data, eval);
             self.fill_step_on_step_end(interp, data, eval);
-            return eval;
+            return eval
         }
         InstructionResult::Continue
     }
@@ -471,7 +471,7 @@ struct StackStep {
 fn is_precompile_call<DB: Database>(data: &EVMData<'_, DB>, to: &Address, value: U256) -> bool {
     // TODO if data.precompiles.contains(to) {
     if false {
-        return data.journaled_state.depth() > 0 && value == U256::ZERO;
+        return data.journaled_state.depth() > 0 && value == U256::ZERO
     }
     false
 }

@@ -2,13 +2,10 @@ use reth_interfaces::Error;
 use reth_primitives::{H160, H256, KECCAK_EMPTY, U256};
 use reth_provider::StateProvider;
 use revm::{
-    db::{CacheDB, DatabaseRef},
+    db::DatabaseRef,
     primitives::{AccountInfo, Bytecode},
     Database,
 };
-
-/// SubState of database. Uses revm internal cache with binding to reth StateProvider trait.
-pub type SubState<DB> = CacheDB<State<DB>>;
 
 /// Wrapper around StateProvider that implements revm database trait
 #[derive(Debug, Clone)]
@@ -71,7 +68,7 @@ impl<DB: StateProvider> Database for State<DB> {
 }
 
 impl<DB: StateProvider> DatabaseRef for State<DB> {
-    type Error = Error;
+    type Error = <Self as Database>::Error;
 
     fn basic(&self, address: H160) -> Result<Option<AccountInfo>, Self::Error> {
         Ok(self.0.basic_account(address)?.map(|account| AccountInfo {

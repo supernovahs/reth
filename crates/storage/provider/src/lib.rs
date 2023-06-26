@@ -50,4 +50,4 @@ pub mod chain;
 pub use chain::Chain;
 
 pub mod change;
-pub use change::StateChange;
+pub use change::{BundleState, StateChange, StateReverts};

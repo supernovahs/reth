@@ -3,7 +3,7 @@ use reth_primitives::{Address, U64};
 use reth_rpc_types::{trace::parity::*, TransactionInfo};
 use revm::{
     db::DatabaseRef,
-    primitives::{AccountInfo, ExecutionResult, ResultAndState},
+    primitives::{AccountInfo, ExecutionResult, ResultAndState}, Database,
 };
 use std::collections::HashSet;
 
@@ -148,17 +148,17 @@ impl ParityTraceBuilder {
         self,
         res: ResultAndState,
         trace_types: &HashSet<TraceType>,
-        db: DB,
+        db: &mut DB,
     ) -> Result<TraceResults, DB::Error>
     where
-        DB: DatabaseRef,
+        DB: Database,
     {
         let ResultAndState { result, state } = res;
         let mut trace_res = self.into_trace_results(result, trace_types);
         if let Some(ref mut state_diff) = trace_res.state_diff {
             populate_account_balance_nonce_diffs(
                 state_diff,
-                &db,
+                db,
                 state.into_iter().map(|(addr, acc)| (addr, acc.info)),
             )?;
         }
@@ -235,12 +235,12 @@ fn vm_trace(nodes: &[CallTraceNode]) -> VmTrace {
 /// all the accounts that are in the state map and never has to fetch them from disk.
 pub fn populate_account_balance_nonce_diffs<DB, I>(
     state_diff: &mut StateDiff,
-    db: DB,
+    db: &mut DB,
     account_diffs: I,
 ) -> Result<(), DB::Error>
 where
     I: IntoIterator<Item = (Address, AccountInfo)>,
-    DB: DatabaseRef,
+    DB: Database,
 {
     for (addr, changed_acc) in account_diffs.into_iter() {
         let entry = state_diff.entry(addr).or_default();

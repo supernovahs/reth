@@ -36,6 +36,11 @@ impl Chain {
         &self.state
     }
 
+    /// Length of block inside
+    pub fn len(&self) -> usize {
+        self.blocks.len()
+    }
+
     /// Return true if chain is empty and has no blocks.
     pub fn is_empty(&self) -> bool {
         self.blocks.is_empty()

@@ -9,11 +9,10 @@ use reth_primitives::{
     Block, BlockBody, ChainSpec, Header, IntoRecoveredTransaction, ReceiptWithBloom,
     SealedBlockWithSenders, EMPTY_OMMER_ROOT, U256,
 };
-use reth_provider::{CanonChainTracker, CanonStateNotificationSender, Chain, StateProviderFactory};
-use reth_revm::{
-    database::{State, SubState},
-    executor::Executor,
+use reth_provider::{
+    BlockExecutor, CanonChainTracker, CanonStateNotificationSender, Chain, StateProviderFactory,
 };
+use reth_revm::{database::State, new_executor::NewExecutor};
 use reth_stages::PipelineEvent;
 use reth_transaction_pool::{TransactionPool, ValidPoolTransaction};
 use std::{
@@ -169,8 +168,8 @@ where
                         Block { header, body: transactions, ommers: vec![], withdrawals: None };
 
                     // execute the new block
-                    let substate = SubState::new(State::new(client.latest().unwrap()));
-                    let mut executor = Executor::new(chain_spec, substate);
+                    let substate = State::new(client.latest().unwrap());
+                    let mut executor = NewExecutor::new(chain_spec, substate);
 
                     trace!(target: "consensus::auto", transactions=?&block.body, "executing transactions");
 
@@ -181,18 +180,18 @@ where
                         .collect::<Option<Vec<_>>>()?;
 
                     match executor.execute_transactions(&block, U256::ZERO, Some(senders.clone())) {
-                        Ok((post_state, gas_used)) => {
+                        Ok(gas_used) => {
                             // apply post block changes
-                            let post_state = executor
-                                .apply_post_block_changes(&block, U256::ZERO, post_state)
-                                .unwrap();
+                            executor.post_execution_state_change(&block, U256::ZERO).unwrap();
+
+                            let bundle_state = executor.take_output_state();
 
                             let Block { mut header, body, .. } = block;
 
                             // clear all transactions from pool
                             pool.remove_transactions(body.iter().map(|tx| tx.hash()));
 
-                            let receipts = post_state.receipts(header.number);
+                            let receipts = bundle_state.receipts_by_block(header.number);
                             header.receipts_root = if receipts.is_empty() {
                                 EMPTY_RECEIPTS
                             } else {
@@ -207,12 +206,13 @@ where
                                 BlockBody { transactions: body, ommers: vec![], withdrawals: None };
                             header.gas_used = gas_used;
 
-                            trace!(target: "consensus::auto", ?post_state, ?header, ?body, "executed block, calculating root");
+                            trace!(target: "consensus::auto", ?bundle_state, ?header, ?body, "executed block, calculating root");
 
                             // calculate the state root
-                            let state_root =
-                                executor.db().db.0.state_root(post_state.clone()).unwrap();
-                            header.state_root = state_root;
+                            // TODO reanable state root calculation
+                            //let state_root =
+                            //    executor.db().db.0.state_root(post_state.clone()).unwrap();
+                            //header.state_root = state_root;
 
                             trace!(target: "consensus::auto", root=?header.state_root, ?body, "calculated root");
 
@@ -273,7 +273,7 @@ where
                             debug!(target: "consensus::auto", header=?sealed_block_with_senders.hash(), "sending block notification");
 
                             let chain =
-                                Arc::new(Chain::new(vec![(sealed_block_with_senders, post_state)]));
+                                Arc::new(Chain::new(vec![sealed_block_with_senders], bundle_state));
 
                             // send block notification
                             let _ = canon_state_notification

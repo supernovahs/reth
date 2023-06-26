@@ -1,11 +1,10 @@
 use crate::{
-    change::BundleState,
+    change::{BundleState, BundleStateInit},
     insert_canonical_block,
-    post_state::StorageChangeset,
     traits::{AccountExtProvider, BlockSource, ReceiptProvider, StageCheckpointWriter},
     AccountProvider, BlockHashProvider, BlockNumProvider, BlockProvider, Chain, EvmEnvProvider,
-    HeaderProvider, PostState, ProviderError, StageCheckpointReader, TransactionError,
-    TransactionsProvider, WithdrawalsProvider,
+    HeaderProvider, ProviderError, StageCheckpointReader, TransactionError, TransactionsProvider,
+    WithdrawalsProvider,
 };
 use itertools::{izip, Itertools};
 use reth_db::{
@@ -38,7 +37,7 @@ use reth_revm_primitives::{
 };
 use reth_trie::StateRoot;
 use std::{
-    collections::{btree_map::Entry, hash_map, BTreeMap, BTreeSet, HashMap},
+    collections::{hash_map, BTreeMap, BTreeSet, HashMap},
     fmt::Debug,
     ops::{Deref, DerefMut, Range, RangeBounds, RangeInclusive},
     sync::Arc,
@@ -116,7 +115,7 @@ fn unwind_account_history_shards<'a, TX: reth_db::transaction::DbTxMutGAT<'a>>(
     while let Some((sharded_key, list)) = item {
         // there is no more shard for address
         if sharded_key.key != address {
-            break;
+            break
         }
         cursor.delete_current()?;
         // check first item and if it is more and eq than `block_number` delete current
@@ -124,14 +123,14 @@ fn unwind_account_history_shards<'a, TX: reth_db::transaction::DbTxMutGAT<'a>>(
         let first = list.iter(0).next().expect("List can't empty");
         if first >= block_number as usize {
             item = cursor.prev()?;
-            continue;
+            continue
         } else if block_number <= sharded_key.highest_block_number {
             // if first element is in scope whole list would be removed.
             // so at least this first element is present.
-            return Ok(list.iter(0).take_while(|i| *i < block_number as usize).collect::<Vec<_>>());
+            return Ok(list.iter(0).take_while(|i| *i < block_number as usize).collect::<Vec<_>>())
         } else {
             let new_list = list.iter(0).collect::<Vec<_>>();
-            return Ok(new_list);
+            return Ok(new_list)
         }
     }
     Ok(Vec::new())
@@ -151,11 +150,11 @@ fn unwind_storage_history_shards<'a, TX: reth_db::transaction::DbTxMutGAT<'a>>(
 
     while let Some((storage_sharded_key, list)) = item {
         // there is no more shard for address
-        if storage_sharded_key.address != address
-            || storage_sharded_key.sharded_key.key != storage_key
+        if storage_sharded_key.address != address ||
+            storage_sharded_key.sharded_key.key != storage_key
         {
             // there is no more shard for address and storage_key.
-            break;
+            break
         }
         cursor.delete_current()?;
         // check first item and if it is more and eq than `block_number` delete current
@@ -163,13 +162,13 @@ fn unwind_storage_history_shards<'a, TX: reth_db::transaction::DbTxMutGAT<'a>>(
         let first = list.iter(0).next().expect("List can't empty");
         if first >= block_number as usize {
             item = cursor.prev()?;
-            continue;
+            continue
         } else if block_number <= storage_sharded_key.sharded_key.highest_block_number {
             // if first element is in scope whole list would be removed.
             // so at least this first element is present.
-            return Ok(list.iter(0).take_while(|i| *i < block_number as usize).collect::<Vec<_>>());
+            return Ok(list.iter(0).take_while(|i| *i < block_number as usize).collect::<Vec<_>>())
         } else {
-            return Ok(list.iter(0).collect::<Vec<_>>());
+            return Ok(list.iter(0).collect::<Vec<_>>())
         }
     }
     Ok(Vec::new())
@@ -538,200 +537,15 @@ impl<'this, TX: DbTxMut<'this> + DbTx<'this>> DatabaseProvider<'this, TX> {
         Ok(changesets)
     }
 
-    /// Traverse over changesets and plain state and recreate the [`PostState`]s for the given range
-    /// of blocks.
-    ///
-    /// 1. Iterate over the [BlockBodyIndices][tables::BlockBodyIndices] table to get all
-    /// the transaction ids.
-    /// 2. Iterate over the [StorageChangeSet][tables::StorageChangeSet] table
-    /// and the [AccountChangeSet][tables::AccountChangeSet] tables in reverse order to reconstruct
-    /// the changesets.
-    ///     - In order to have both the old and new values in the changesets, we also access the
-    ///       plain state tables.
-    /// 3. While iterating over the changeset tables, if we encounter a new account or storage slot,
-    /// we:
-    ///     1. Take the old value from the changeset
-    ///     2. Take the new value from the plain state
-    ///     3. Save the old value to the local state
-    /// 4. While iterating over the changeset tables, if we encounter an account/storage slot we
-    /// have seen before we:
-    ///     1. Take the old value from the changeset
-    ///     2. Take the new value from the local state
-    ///     3. Set the local state to the value in the changeset
-    ///
-    /// If `TAKE` is `true`, the local state will be written to the plain state tables.
-    /// 5. Get all receipts from table
-    fn get_take_block_execution_result_range<const TAKE: bool>(
-        &self,
-        range: RangeInclusive<BlockNumber>,
-    ) -> std::result::Result<BundleState, TransactionError> {
-        if range.is_empty() {
-            return Ok(BundleState::default());
-        }
-
-        // We are not removing block meta as it is used to get block changesets.
-        let block_bodies = self.get_or_take::<tables::BlockBodyIndices, false>(range.clone())?;
-
-        // get transaction receipts
-        let from_transaction_num =
-            block_bodies.first().expect("already checked if there are blocks").1.first_tx_num();
-        let to_transaction_num =
-            block_bodies.last().expect("already checked if there are blocks").1.last_tx_num();
-
-        let storage_range = BlockNumberAddress::range(range.clone());
-
-        let storage_changeset =
-            self.get_or_take::<tables::StorageChangeSet, TAKE>(storage_range)?;
-        let account_changeset = self.get_or_take::<tables::AccountChangeSet, TAKE>(range)?;
-
-        // iterate previous value and get plain state value to create changeset
-        // Double option around Account represent if Account state is know (first option) and
-        // account is removed (Second Option)
-        type LocalPlainState = BTreeMap<Address, (Option<Option<Account>>, BTreeMap<H256, U256>)>;
-
-        let mut local_plain_state: LocalPlainState = BTreeMap::new();
-
-        // iterate in reverse and get plain state.
-
-        // Bundle execution changeset to its particular transaction and block
-        let mut block_states =
-            BTreeMap::from_iter(block_bodies.iter().map(|(num, _)| (*num, PostState::default())));
-
-        // TODO this was not working for blocks that are not at tip. as plain state is not the last state of end range.
-        // We should rename the functions or add support to access History state. Accessing history state
-        // can be tricky but we are not gaining anything.
-        // For now I will leave it as it is and come back to it later.
-        let mut plain_accounts_cursor = self.tx.cursor_write::<tables::PlainAccountState>()?;
-        let mut plain_storage_cursor = self.tx.cursor_dup_write::<tables::PlainStorageState>()?;
-
-        // add account changeset changes
-        for (block_number, account_before) in account_changeset.into_iter().rev() {
-            let AccountBeforeTx { info: old_info, address } = account_before;
-            let new_info = match local_plain_state.entry(address) {
-                Entry::Vacant(entry) => {
-                    let new_account = plain_accounts_cursor.seek_exact(address)?.map(|kv| kv.1);
-                    entry.insert((Some(old_info), BTreeMap::new()));
-                    new_account
-                }
-                Entry::Occupied(mut entry) => {
-                    let new_account = std::mem::replace(&mut entry.get_mut().0, Some(old_info));
-                    new_account.expect("As we are stacking account first, account would always be Some(Some) or Some(None)")
-                }
-            };
-
-            let post_state = block_states.entry(block_number).or_default();
-            match (old_info, new_info) {
-                (Some(old), Some(new)) => {
-                    if new != old {
-                        post_state.change_account(block_number, address, old, new);
-                    } else {
-                        unreachable!("Junk data in database: an account changeset did not represent any change");
-                    }
-                }
-                (None, Some(account)) =>  post_state.create_account(block_number, address, account),
-                (Some(old), None) =>
-                    post_state.destroy_account(block_number, address, old),
-                (None, None) => unreachable!("Junk data in database: an account changeset transitioned from no account to no account"),
-            };
-        }
-
-        // add storage changeset changes
-        let mut storage_changes: BTreeMap<BlockNumberAddress, StorageChangeset> = BTreeMap::new();
-        for (block_and_address, storage_entry) in storage_changeset.into_iter().rev() {
-            let BlockNumberAddress((_, address)) = block_and_address;
-            let new_storage =
-                match local_plain_state.entry(address).or_default().1.entry(storage_entry.key) {
-                    Entry::Vacant(entry) => {
-                        let new_storage = plain_storage_cursor
-                            .seek_by_key_subkey(address, storage_entry.key)?
-                            .filter(|storage| storage.key == storage_entry.key)
-                            .unwrap_or_default();
-                        entry.insert(storage_entry.value);
-                        new_storage.value
-                    }
-                    Entry::Occupied(mut entry) => {
-                        std::mem::replace(entry.get_mut(), storage_entry.value)
-                    }
-                };
-            storage_changes.entry(block_and_address).or_default().insert(
-                U256::from_be_bytes(storage_entry.key.0),
-                (storage_entry.value, new_storage),
-            );
-        }
-
-        for (BlockNumberAddress((block_number, address)), storage_changeset) in
-            storage_changes.into_iter()
-        {
-            block_states.entry(block_number).or_default().change_storage(
-                block_number,
-                address,
-                storage_changeset,
-            );
-        }
-
-        if TAKE {
-            // iterate over local plain state remove all account and all storages.
-            for (address, (account, storage)) in local_plain_state.into_iter() {
-                // revert account
-                if let Some(account) = account {
-                    let existing_entry = plain_accounts_cursor.seek_exact(address)?;
-                    if let Some(account) = account {
-                        plain_accounts_cursor.upsert(address, account)?;
-                    } else if existing_entry.is_some() {
-                        plain_accounts_cursor.delete_current()?;
-                    }
-                }
-
-                // revert storages
-                for (storage_key, storage_value) in storage.into_iter() {
-                    let storage_entry = StorageEntry { key: storage_key, value: storage_value };
-                    // delete previous value
-                    // TODO: This does not use dupsort features
-                    if plain_storage_cursor
-                        .seek_by_key_subkey(address, storage_key)?
-                        .filter(|s| s.key == storage_key)
-                        .is_some()
-                    {
-                        plain_storage_cursor.delete_current()?
-                    }
-
-                    // TODO: This does not use dupsort features
-                    // insert value if needed
-                    if storage_value != U256::ZERO {
-                        plain_storage_cursor.upsert(address, storage_entry)?;
-                    }
-                }
-            }
-        }
-
-        // iterate over block body and create ExecutionResult
-        let mut receipt_iter = self
-            .get_or_take::<tables::Receipts, TAKE>(from_transaction_num..=to_transaction_num)?
-            .into_iter();
-
-        let receipts = Vec::new();
-        // loop break if we are at the end of the blocks.
-        for (block_number, block_body) in block_bodies.into_iter() {
-            let mut block_receipt = Vec::new();
-            for _ in block_body.tx_num_range() {
-                if let Some((_, receipt)) = receipt_iter.next() {
-                    block_receipt.push(receipt);
-                }
-            }
-            receipts.push(block_receipt);
-        }
-
-        Ok(BundleState::new(false, receipts, *range.start()))
-    }
-
     /// Unwind or peek at last N blocks of state
     pub fn unwind_or_peek_state<const UNWIND: bool>(
         &self,
         range: RangeInclusive<BlockNumber>,
     ) -> std::result::Result<BundleState, TransactionError> {
         if range.is_empty() {
-            return Ok(BundleState::default());
+            return Ok(BundleState::default())
         }
+        let start_block_number = *range.start();
 
         // We are not removing block meta as it is used to get block changesets.
         let block_bodies = self.get_or_take::<tables::BlockBodyIndices, false>(range.clone())?;
@@ -741,8 +555,6 @@ impl<'this, TX: DbTxMut<'this> + DbTx<'this>> DatabaseProvider<'this, TX> {
             block_bodies.first().expect("already checked if there are blocks").1.first_tx_num();
         let to_transaction_num =
             block_bodies.last().expect("already checked if there are blocks").1.last_tx_num();
-        let receipts = self
-            .get_or_take::<tables::Receipts, UNWIND>(from_transaction_num..=to_transaction_num)?;
 
         let storage_range = BlockNumberAddress::range(range.clone());
 
@@ -753,23 +565,13 @@ impl<'this, TX: DbTxMut<'this> + DbTx<'this>> DatabaseProvider<'this, TX> {
         // iterate previous value and get plain state value to create changeset
         // Double option around Account represent if Account state is know (first option) and
         // account is removed (Second Option)
-        type OldNewState = HashMap<
-            Address,
-            (Option<(Option<Account>, Option<Account>)>, HashMap<H256, (U256, U256)>),
-        >;
 
-        let mut state: OldNewState = HashMap::new();
+        let mut state: BundleStateInit = HashMap::new();
 
-        // iterate in reverse and get plain state.
-
-        // Bundle execution changeset to its particular transaction and block
-        let mut block_states =
-            BTreeMap::from_iter(block_bodies.iter().map(|(num, _)| (*num, PostState::default())));
-
-        // TODO this was not working for blocks that are not at tip. as plain state is not the last state of end range.
-        // We should rename the functions or add support to access History state. Accessing history state
-        // can be tricky but we are not gaining anything.
-        // For now I will leave it as it is and come back to it later.
+        // TODO this was not working for blocks that are not at tip. as plain state is not the last
+        // state of end range. We should rename the functions or add support to access
+        // History state. Accessing history state can be tricky but we are not gaining
+        // anything. For now I will leave it as it is and come back to it later.
         let mut plain_accounts_cursor = self.tx.cursor_write::<tables::PlainAccountState>()?;
         let mut plain_storage_cursor = self.tx.cursor_dup_write::<tables::PlainStorageState>()?;
 
@@ -796,7 +598,6 @@ impl<'this, TX: DbTxMut<'this> + DbTx<'this>> DatabaseProvider<'this, TX> {
         }
 
         // add storage changeset changes
-        let mut storage_changes: BTreeMap<BlockNumberAddress, StorageChangeset> = BTreeMap::new();
         for (block_and_address, old_storage) in storage_changeset.into_iter().rev() {
             let BlockNumberAddress((block_number, address)) = block_and_address;
             match state.entry(address).or_default().1.entry(old_storage.key) {
@@ -826,34 +627,34 @@ impl<'this, TX: DbTxMut<'this> + DbTx<'this>> DatabaseProvider<'this, TX> {
 
         if UNWIND {
             // iterate over local plain state remove all account and all storages.
-            for (address, (accounts, storage)) in state.into_iter() {
+            for (address, (accounts, storage)) in state.iter() {
                 // revert account
                 if let Some((old_account, _)) = accounts {
-                    let existing_entry = plain_accounts_cursor.seek_exact(address)?;
+                    let existing_entry = plain_accounts_cursor.seek_exact(*address)?;
                     if let Some(account) = old_account {
-                        plain_accounts_cursor.upsert(address, account)?;
+                        plain_accounts_cursor.upsert(*address, *account)?;
                     } else if existing_entry.is_some() {
                         plain_accounts_cursor.delete_current()?;
                     }
                 }
 
                 // revert storages
-                for (storage_key, (old_storage_value, new_storage_value)) in storage.into_iter() {
-                    let storage_entry = StorageEntry { key: storage_key, value: old_storage_value };
+                for (storage_key, (old_storage_value, _new_storage_value)) in storage.into_iter() {
+                    let storage_entry =
+                        StorageEntry { key: *storage_key, value: *old_storage_value };
                     // delete previous value
                     // TODO: This does not use dupsort features
                     if plain_storage_cursor
-                        .seek_by_key_subkey(address, storage_key)?
-                        .filter(|s| s.key == storage_key)
+                        .seek_by_key_subkey(*address, *storage_key)?
+                        .filter(|s| s.key == *storage_key)
                         .is_some()
                     {
                         plain_storage_cursor.delete_current()?
                     }
 
-                    // TODO: This does not use dupsort features
                     // insert value if needed
-                    if old_storage_value != U256::ZERO {
-                        plain_storage_cursor.upsert(address, storage_entry)?;
+                    if *old_storage_value != U256::ZERO {
+                        plain_storage_cursor.upsert(*address, storage_entry)?;
                     }
                 }
             }
@@ -866,7 +667,7 @@ impl<'this, TX: DbTxMut<'this> + DbTx<'this>> DatabaseProvider<'this, TX> {
 
         let mut receipts = Vec::new();
         // loop break if we are at the end of the blocks.
-        for (block_number, block_body) in block_bodies.into_iter() {
+        for (_, block_body) in block_bodies.into_iter() {
             let mut block_receipt = Vec::new();
             for _ in block_body.tx_num_range() {
                 if let Some((_, receipt)) = receipt_iter.next() {
@@ -876,7 +677,7 @@ impl<'this, TX: DbTxMut<'this> + DbTx<'this>> DatabaseProvider<'this, TX> {
             receipts.push(block_receipt);
         }
 
-        Ok(BundleState::new(false, receipts, *range.start()))
+        Ok(BundleState::new_init(state, receipts, start_block_number))
     }
 
     /// Return range of blocks and its execution result
@@ -914,7 +715,7 @@ impl<'this, TX: DbTxMut<'this> + DbTx<'this>> DatabaseProvider<'this, TX> {
                     expected: parent_state_root,
                     block_number: parent_number,
                     block_hash: parent_hash,
-                });
+                })
             }
             trie_updates.flush(&self.tx)?;
         }
@@ -922,10 +723,7 @@ impl<'this, TX: DbTxMut<'this> + DbTx<'this>> DatabaseProvider<'this, TX> {
         let blocks = self.get_take_block_range::<TAKE>(chain_spec, range.clone())?;
         let unwind_to = blocks.first().map(|b| b.number.saturating_sub(1));
         // get execution res
-        let execution_res = self.get_take_block_execution_result_range::<TAKE>(range.clone())?;
-        // combine them
-        let blocks_with_exec_result: Vec<_> = 
-            blocks.into_iter().zip(execution_res.into_iter()).collect();
+        let execution_state = self.unwind_or_peek_state::<TAKE>(range.clone())?;
 
         // remove block bodies it is needed for both get block range and get block execution results
         // that is why it is deleted afterwards.
@@ -942,7 +740,7 @@ impl<'this, TX: DbTxMut<'this> + DbTx<'this>> DatabaseProvider<'this, TX> {
         // return them
         // TODO
         //Ok(blocks_with_exec_result)
-        Ok(Chain::default())
+        Ok(Chain::new(blocks, execution_state))
     }
 
     /// Return list of entries from table
@@ -980,7 +778,7 @@ impl<'this, TX: DbTxMut<'this> + DbTx<'this>> DatabaseProvider<'this, TX> {
         let block_bodies = self.get_or_take::<tables::BlockBodyIndices, false>(range)?;
 
         if block_bodies.is_empty() {
-            return Ok(Vec::new());
+            return Ok(Vec::new())
         }
 
         // Compute the first and last tx ID in the range
@@ -989,7 +787,7 @@ impl<'this, TX: DbTxMut<'this> + DbTx<'this>> DatabaseProvider<'this, TX> {
 
         // If this is the case then all of the blocks in the range are empty
         if last_transaction < first_transaction {
-            return Ok(block_bodies.into_iter().map(|(n, _)| (n, Vec::new())).collect());
+            return Ok(block_bodies.into_iter().map(|(n, _)| (n, Vec::new())).collect())
         }
 
         // Get transactions and senders
@@ -1059,7 +857,7 @@ impl<'this, TX: DbTxMut<'this> + DbTx<'this>> DatabaseProvider<'this, TX> {
 
         let block_headers = self.get_or_take::<tables::Headers, TAKE>(range.clone())?;
         if block_headers.is_empty() {
-            return Ok(Vec::new());
+            return Ok(Vec::new())
         }
 
         let block_header_hashes =
@@ -1278,7 +1076,7 @@ impl<'this, TX: DbTxMut<'this> + DbTx<'this>> DatabaseProvider<'this, TX> {
 
         while let Some(Ok((entry_key, _))) = reverse_walker.next() {
             if selector(entry_key.clone()) <= key {
-                break;
+                break
             }
             reverse_walker.delete_current()?;
             deleted += 1;
@@ -1316,7 +1114,7 @@ impl<'this, TX: DbTxMut<'this> + DbTx<'this>> DatabaseProvider<'this, TX> {
             // delete old shard so new one can be inserted.
             self.tx.delete::<tables::AccountHistory>(shard_key, None)?;
             let list = list.iter(0).map(|i| i as u64).collect::<Vec<_>>();
-            return Ok(list);
+            return Ok(list)
         }
         Ok(Vec::new())
     }
@@ -1334,7 +1132,7 @@ impl<'this, TX: DbTxMut<'this> + DbTx<'this>> DatabaseProvider<'this, TX> {
             // delete old shard so new one can be inserted.
             self.tx.delete::<tables::StorageHistory>(storage_shard_key, None)?;
             let list = list.iter(0).map(|i| i as u64).collect::<Vec<_>>();
-            return Ok(list);
+            return Ok(list)
         }
         Ok(Vec::new())
     }
@@ -1407,13 +1205,13 @@ impl<'this, TX: DbTxMut<'this> + DbTx<'this>> DatabaseProvider<'this, TX> {
 
     /// Append blocks and insert its post state.
     /// This will insert block data to all related tables and will update pipeline progress.
-    pub fn append_blocks_with_post_state(
+    pub fn append_blocks_with_bundle_state(
         &mut self,
         blocks: Vec<SealedBlockWithSenders>,
-        state: PostState,
+        state: BundleState,
     ) -> std::result::Result<(), TransactionError> {
         if blocks.is_empty() {
-            return Ok(());
+            return Ok(())
         }
         let new_tip = blocks.last().unwrap();
         let new_tip_number = new_tip.number;
@@ -1433,7 +1231,7 @@ impl<'this, TX: DbTxMut<'this> + DbTx<'this>> DatabaseProvider<'this, TX> {
 
         // Write state and changesets to the database.
         // Must be written after blocks because of the receipt lookup.
-        state.write_to_db(self.tx_mut())?;
+        state.write_to_db(self.tx_mut(), true)?;
 
         self.insert_hashes(first_number..=last_block_number, last_block_hash, expected_state_root)?;
 
@@ -1511,7 +1309,7 @@ impl<'this, TX: DbTxMut<'this> + DbTx<'this>> DatabaseProvider<'this, TX> {
                     expected: expected_state_root,
                     block_number: *range.end(),
                     block_hash: end_block_hash,
-                });
+                })
             }
             trie_updates.flush(&self.tx)?;
         }
@@ -1576,7 +1374,7 @@ impl<'this, TX: DbTx<'this>> HeaderProvider for DatabaseProvider<'this, TX> {
         if let Some(td) = self.chain_spec.final_paris_total_difficulty(number) {
             // if this block is higher than the final paris(merge) block, return the final paris
             // difficulty
-            return Ok(Some(td));
+            return Ok(Some(td))
         }
 
         Ok(self.tx.get::<tables::HeaderTD>(number)?.map(|td| td.0))
@@ -1673,7 +1471,7 @@ impl<'this, TX: DbTx<'this>> BlockProvider for DatabaseProvider<'this, TX> {
                     .transactions_by_block(number.into())?
                     .ok_or(ProviderError::BlockBodyIndicesNotFound(number))?;
 
-                return Ok(Some(Block { header, body: transactions, ommers, withdrawals }));
+                return Ok(Some(Block { header, body: transactions, ommers, withdrawals }))
             }
         }
 
@@ -1689,11 +1487,11 @@ impl<'this, TX: DbTx<'this>> BlockProvider for DatabaseProvider<'this, TX> {
             // If the Paris (Merge) hardfork block is known and block is after it, return empty
             // ommers.
             if self.chain_spec.final_paris_total_difficulty(number).is_some() {
-                return Ok(Some(Vec::new()));
+                return Ok(Some(Vec::new()))
             }
 
             let ommers = self.tx.get::<tables::BlockOmmers>(number)?.map(|o| o.ommers);
-            return Ok(ommers);
+            return Ok(ommers)
         }
 
         Ok(None)
@@ -1791,7 +1589,7 @@ impl<'this, TX: DbTx<'this>> TransactionsProvider for DatabaseProvider<'this, TX
                                 base_fee: header.base_fee_per_gas,
                             };
 
-                            return Ok(Some((transaction, meta)));
+                            return Ok(Some((transaction, meta)))
                         }
                     }
                 }
@@ -1822,7 +1620,7 @@ impl<'this, TX: DbTx<'this>> TransactionsProvider for DatabaseProvider<'this, TX
                         .map(|result| result.map(|(_, tx)| tx.into()))
                         .collect::<std::result::Result<Vec<_>, _>>()?;
                     Ok(Some(transactions))
-                };
+                }
             }
         }
         Ok(None)
@@ -1904,7 +1702,7 @@ impl<'this, TX: DbTx<'this>> ReceiptProvider for DatabaseProvider<'this, TX> {
                         .map(|result| result.map(|(_, tx)| tx))
                         .collect::<std::result::Result<Vec<_>, _>>()?;
                     Ok(Some(transactions))
-                };
+                }
             }
         }
         Ok(None)
@@ -1926,7 +1724,7 @@ impl<'this, TX: DbTx<'this>> WithdrawalsProvider for DatabaseProvider<'this, TX>
                     .get::<tables::BlockWithdrawals>(number)
                     .map(|w| w.map(|w| w.withdrawals))?
                     .unwrap_or_default();
-                return Ok(Some(withdrawals));
+                return Ok(Some(withdrawals))
             }
         }
         Ok(None)

@@ -1,5 +1,6 @@
 //! Wrapper around revms state.
-//!
+use std::collections::HashMap;
+
 use reth_db::{
     cursor::{DbCursorRO, DbCursorRW, DbDupCursorRO, DbDupCursorRW},
     models::{AccountBeforeTx, BlockNumberAddress},
@@ -7,12 +8,14 @@ use reth_db::{
     transaction::{DbTx, DbTxMut},
 };
 use reth_interfaces::db::DatabaseError;
-use reth_primitives::{BlockNumber, Bytecode, Receipt, StorageEntry, H256, U256};
+use reth_primitives::{Account, Address, BlockNumber, Bytecode, Receipt, StorageEntry, H256, U256};
 use reth_revm_primitives::{
     db::states::{
         BundleState as RevmBundleState, StateChangeset as RevmChange, StateReverts as RevmReverts,
     },
-    into_reth_acc,
+    into_reth_acc, into_revm_acc,
+    primitives::AccountInfo,
+    to_reth_acc,
 };
 
 /// Bundle state of post execution changes and reverts
@@ -26,25 +29,94 @@ pub struct BundleState {
     first_block: BlockNumber,
 }
 
+/// Type used to initialize revms bundle state.
+pub type BundleStateInit =
+    HashMap<Address, (Option<(Option<Account>, Option<Account>)>, HashMap<H256, (U256, U256)>)>;
+
 impl BundleState {
-    /// Create new bundle state with receipts.
-    pub fn new(state: bool, receipts: Vec<Vec<Receipt>>, first_block: BlockNumber) -> Self {
-        Self { bundle: RevmBundleState::default(), receipts, first_block }
+    /// Create Bundle State.
+    pub fn new(
+        bundle: RevmBundleState,
+        receipts: Vec<Vec<Receipt>>,
+        first_block: BlockNumber,
+    ) -> Self {
+        Self { bundle, receipts, first_block }
     }
+
+    /// Return revm bundle state.
+    pub fn state(&self) -> &RevmBundleState {
+        &self.bundle
+    }
+
+    /// Return iterator over all accounts
+    pub fn accounts_iter(&self) -> impl Iterator<Item = (Address, Option<&AccountInfo>)> {
+        self.bundle.state().iter().map(|(a, acc)| (*a, acc.info.as_ref())).into_iter()
+    }
+
+    /// Get account if account is known.
+    pub fn account(&self, address: &Address) -> Option<Option<Account>> {
+        self.bundle.account(address).map(|a| a.info.as_ref().map(to_reth_acc))
+    }
+
+    /// Get storage if value is known.
+    ///
+    /// This means that depending on status we can potentially return U256::ZERO.
+    pub fn storage(&self, address: &Address, storage_key: U256) -> Option<U256> {
+        self.bundle.account(address).and_then(|a| a.storage_slot(storage_key))
+    }
+
+    /// Return bytecode if known.
+    pub fn bytecode(&self, code_hash: &H256) -> Option<Bytecode> {
+        self.bundle.bytecode(code_hash).map(|b| Bytecode(b))
+    }
+
+    /// Create new bundle state with receipts.
+    pub fn new_init(
+        bundle_init: BundleStateInit,
+        receipts: Vec<Vec<Receipt>>,
+        first_block: BlockNumber,
+    ) -> Self {
+        // initialize revm bundle
+        let bundle =
+            RevmBundleState::new(bundle_init.into_iter().map(|(address, (info, storage))| {
+                (
+                    address,
+                    info.map(|(original, present)| {
+                        (original.map(into_revm_acc), present.map(into_revm_acc))
+                    }),
+                    storage.into_iter().map(|(k, s)| (k.into(), s)).collect(),
+                )
+            }));
+
+        Self { bundle, receipts, first_block }
+    }
+
+    //pub fn account
 
     /// Return reference to receipts.
     pub fn receipts(&self) -> &Vec<Vec<Receipt>> {
         &self.receipts
     }
 
+    /// Return all block receipts
+    pub fn receipts_by_block(&self, block_number: BlockNumber) -> &[Receipt] {
+        if block_number < self.first_block || block_number > self.last_block() {
+            return &[]
+        }
+        self.receipts[(block_number - self.first_block) as usize].as_slice()
+    }
+
+    /// Number of blocks in bundle state.
     pub fn len(&self) -> usize {
         self.receipts.len()
     }
 
+    /// Return first block of the bundle
     pub fn first_block(&self) -> BlockNumber {
         self.first_block
     }
 
+    /// Return last block of the bundle.
     pub fn last_block(&self) -> BlockNumber {
         self.first_block + self.len() as BlockNumber
     }
@@ -52,14 +124,14 @@ impl BundleState {
     /// Revert to given block number.
     ///
     /// Note: Give Block number will stay inside the bundle state.
-    pub fn revert_to(&mut self, block_number: BlockNumber) -> Result<(), DatabaseError> {
+    pub fn revert_to(&mut self, block_number: BlockNumber) {
         let last_block = self.last_block();
         let first_block = self.first_block;
         if block_number >= last_block {
-            return Ok(());
+            return
         }
         if block_number < first_block {
-            return Ok(());
+            return
         }
 
         let rm_trx = (last_block - block_number) as usize;
@@ -69,7 +141,6 @@ impl BundleState {
         self.receipts.truncate(new_len);
         // Revert last n reverts.
         self.bundle.revert(rm_trx);
-        Ok(())
     }
 
     /// This will detach lower part of the chain and return it back.
@@ -84,10 +155,10 @@ impl BundleState {
         let last_block = self.last_block();
         let first_block = self.first_block;
         if block_number >= last_block {
-            return None;
+            return None
         }
         if block_number < first_block {
-            return Some(Self::default());
+            return Some(Self::default())
         }
 
         let num_of_detached_block = block_number - first_block;
@@ -114,6 +185,29 @@ impl BundleState {
     pub fn extend(&mut self, other: Self) {
         self.bundle.extend(other.bundle);
         self.receipts.extend(other.receipts);
+    }
+
+    /// Write bundle state to database.
+    pub fn write_to_db<'a, TX: DbTxMut<'a> + DbTx<'a>>(
+        mut self,
+        tx: &TX,
+        omit_changed_check: bool,
+    ) -> Result<(), DatabaseError> {
+        // write receipts
+        let mut receipts_cursor = tx.cursor_write::<tables::Receipts>()?;
+        let mut next_number = receipts_cursor.last()?.map(|(i, _)| i + 1).unwrap_or_default();
+        for block_receipts in self.receipts.into_iter() {
+            for receipt in block_receipts {
+                receipts_cursor.append(next_number, receipt)?;
+                next_number += 1;
+            }
+        }
+        StateReverts(self.bundle.take_reverts()).write_to_db(tx, self.first_block)?;
+
+        StateChange(self.bundle.take_sorted_plain_change_inner(omit_changed_check))
+            .write_to_db(tx)?;
+
+        Ok(())
     }
 }
 
@@ -174,7 +268,8 @@ impl StateReverts {
                     }
                 } else {
                     // if there is some of wiped storage, they are both sorted, intersect both of
-                    // them and in conflict use change from revert (discard values from wiped storage).
+                    // them and in conflict use change from revert (discard values from wiped
+                    // storage).
                     let mut wiped_iter = wiped_storage.into_iter();
                     let mut revert_iter = storage.into_iter();
 

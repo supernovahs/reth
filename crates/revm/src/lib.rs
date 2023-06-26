@@ -11,7 +11,7 @@
 pub mod database;
 
 /// revm implementation of reth block and transaction executors.
-pub mod executor;
+//pub mod executor;
 mod factory;
 
 /// new revm account state executor

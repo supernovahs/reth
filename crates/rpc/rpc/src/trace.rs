@@ -11,10 +11,11 @@ use crate::{
 };
 use async_trait::async_trait;
 use jsonrpsee::core::RpcResult as Result;
+use reth_interfaces::Error;
 use reth_primitives::{BlockId, BlockNumberOrTag, Bytes, H256};
 use reth_provider::{BlockProvider, EvmEnvProvider, StateProviderBox, StateProviderFactory};
 use reth_revm::{
-    database::{State, SubState},
+    database::State,
     env::tx_env_with_recovered,
     tracing::{
         parity::populate_account_balance_nonce_diffs, TracingInspector, TracingInspectorConfig,
@@ -27,8 +28,8 @@ use reth_rpc_types::{
     BlockError, BlockOverrides, CallRequest, Index, TransactionInfo,
 };
 use reth_tasks::TaskSpawner;
-use revm::{db::CacheDB, primitives::Env};
-use revm_primitives::{db::DatabaseCommit, ExecutionResult, ResultAndState};
+use revm::{db::State as RevmState, primitives::Env};
+use revm_primitives::{ExecutionResult, ResultAndState};
 use std::{collections::HashSet, future::Future, sync::Arc};
 use tokio::sync::{oneshot, AcquireError, OwnedSemaphorePermit};
 
@@ -129,7 +130,7 @@ where
         let config = tracing_config(&trace_types);
         let mut inspector = TracingInspector::new(config);
 
-        let (res, _, db) = self
+        let (res, _, mut db) = self
             .inner
             .eth_api
             .inspect_call_at_and_return_state(call, at, overrides, &mut inspector)
@@ -138,7 +139,7 @@ where
         let trace_res = inspector.into_parity_builder().into_trace_results_with_state(
             res,
             &trace_types,
-            &db,
+            &mut db,
         )?;
 
         Ok(trace_res)
@@ -164,11 +165,11 @@ where
         let config = tracing_config(&trace_types);
 
         self.on_blocking_task(|this| async move {
-            this.inner.eth_api.trace_at_with_state(env, config, at, |inspector, res, db| {
+            this.inner.eth_api.trace_at_with_state(env, config, at, |inspector, res, mut db| {
                 Ok(inspector.into_parity_builder().into_trace_results_with_state(
                     res,
                     &trace_types,
-                    &db,
+                    &mut db,
                 )?)
             })
         })
@@ -191,23 +192,24 @@ where
             // execute all transactions on top of each other and record the traces
             this.inner.eth_api.with_state_at_block(at, move |state| {
                 let mut results = Vec::with_capacity(calls.len());
-                let mut db = SubState::new(State::new(state));
+                let provider = Box::new(State::new(state));
+                let mut state = RevmState::new_without_transitions(provider);
 
                 for (call, trace_types) in calls {
-                    let env = prepare_call_env(
+                    let env = prepare_call_env::<RevmState<'_, Error>>(
                         cfg.clone(),
                         block_env.clone(),
                         call,
-                        &mut db,
+                        &mut state,
                         Default::default(),
                     )?;
                     let config = tracing_config(&trace_types);
                     let mut inspector = TracingInspector::new(config);
-                    let (res, _) = inspect(&mut db, env, &mut inspector)?;
+                    let (res, _) = inspect(&mut state, env, &mut inspector)?;
                     let trace_res = inspector.into_parity_builder().into_trace_results_with_state(
                         res,
                         &trace_types,
-                        &db,
+                        &mut state,
                     )?;
                     results.push(trace_res);
                 }
@@ -228,11 +230,11 @@ where
         self.on_blocking_task(|this| async move {
             this.inner
                 .eth_api
-                .trace_transaction_in_block(hash, config, |_, inspector, res, db| {
+                .trace_transaction_in_block(hash, config, |_, inspector, res, mut db| {
                     let trace_res = inspector.into_parity_builder().into_trace_results_with_state(
                         res,
                         &trace_types,
-                        &db,
+                        &mut db,
                     )?;
                     Ok(trace_res)
                 })
@@ -304,7 +306,7 @@ where
                 TracingInspector,
                 ExecutionResult,
                 &'a revm_primitives::State,
-                &'a CacheDB<State<StateProviderBox<'a>>>,
+                &'a mut RevmState<'_, Error>,
             ) -> EthResult<R>
             + Send
             + 'static,
@@ -333,7 +335,7 @@ where
                 .eth_api
                 .with_state_at_block(state_at.into(), move |state| {
                     let mut results = Vec::with_capacity(transactions.len());
-                    let mut db = SubState::new(State::new(state));
+                    let mut db = RevmState::new_without_transitions(Box::new(State::new(state)));
 
                     let mut transactions = transactions.into_iter().enumerate().peekable();
 
@@ -353,15 +355,16 @@ where
                         let mut inspector = TracingInspector::new(config);
                         let (res, _) = inspect(&mut db, env, &mut inspector)?;
                         let ResultAndState { result, state } = res;
-                        results.push(f(tx_info, inspector, result, &state, &db)?);
+                        results.push(f(tx_info, inspector, result, &state, &mut db)?);
 
                         // need to apply the state changes of this transaction before executing the
                         // next transaction
-                        if transactions.peek().is_some() {
-                            // need to apply the state changes of this transaction before executing
-                            // the next transaction
-                            db.commit(state)
-                        }
+                        // TODO (rakita) revm state check if this is correct.
+                        // if transactions.peek().is_some() {
+                        //     // need to apply the state changes of this transaction before executing
+                        //     // the next transaction
+                        //     db.commit(state)
+                        // }
                     }
 
                     Ok(results)

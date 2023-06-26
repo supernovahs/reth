@@ -1,4 +1,5 @@
 use crate::{
+    change::BundleState,
     traits::{BlockSource, ReceiptProvider},
     AccountProvider, BlockHashProvider, BlockIdProvider, BlockNumProvider, BlockProvider,
     BlockProviderIdExt, EvmEnvProvider, HeaderProvider, PostState, StageCheckpointReader,
@@ -219,7 +220,7 @@ impl AccountProvider for NoopProvider {
 }
 
 impl StateRootProvider for NoopProvider {
-    fn state_root(&self, _post_state: PostState) -> Result<H256> {
+    fn state_root(&self, _state: BundleState) -> Result<H256> {
         todo!()
     }
 }

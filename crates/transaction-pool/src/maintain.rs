@@ -6,7 +6,9 @@ use crate::{
 };
 use futures_util::{Stream, StreamExt};
 use reth_primitives::{Address, BlockHash, BlockNumberOrTag, FromRecoveredTransaction};
-use reth_provider::{BlockProviderIdExt, CanonStateNotification, PostState, StateProviderFactory};
+use reth_provider::{
+    change::BundleState, BlockProviderIdExt, CanonStateNotification, StateProviderFactory,
+};
 use std::{
     borrow::Borrow,
     collections::HashSet,
@@ -82,9 +84,8 @@ pub async fn maintain_transaction_pool<Client, V, T, St>(
 
                 // find all accounts that were changed in the old chain but _not_ in the new chain
                 let missing_changed_acc = old_state
-                    .accounts()
-                    .keys()
-                    .copied()
+                    .accounts_iter()
+                    .map(|(a, _)| a)
                     .filter(|addr| !new_changed_accounts.contains(addr));
 
                 // for these we need to fetch the nonce+balance from the db at the new tip
@@ -161,7 +162,7 @@ pub async fn maintain_transaction_pool<Client, V, T, St>(
                 let pending_block_base_fee =
                     first_block.next_block_base_fee().unwrap_or_default() as u128;
 
-                let mut changed_accounts = Vec::with_capacity(state.accounts().len());
+                let mut changed_accounts = Vec::with_capacity(state.state().len());
                 for acc in changed_accounts_iter(state) {
                     // we can always clear the dirty flag for this account
                     dirty_addresses.remove(&acc.address);
@@ -216,7 +217,7 @@ pub async fn maintain_transaction_pool<Client, V, T, St>(
                     continue
                 }
 
-                let mut changed_accounts = Vec::with_capacity(state.accounts().len());
+                let mut changed_accounts = Vec::with_capacity(state.state().len());
                 for acc in changed_accounts_iter(state) {
                     // we can always clear the dirty flag for this account
                     dirty_addresses.remove(&acc.address);
@@ -322,14 +323,11 @@ where
 }
 
 /// Extracts all changed accounts from the PostState
-fn changed_accounts_iter(state: &PostState) -> impl Iterator<Item = ChangedAccount> + '_ {
-    state.accounts().iter().filter_map(|(addr, acc)| acc.map(|acc| (addr, acc))).map(
-        |(address, acc)| ChangedAccount {
-            address: *address,
-            nonce: acc.nonce,
-            balance: acc.balance,
-        },
-    )
+fn changed_accounts_iter(state: &BundleState) -> impl Iterator<Item = ChangedAccount> + '_ {
+    state
+        .accounts_iter()
+        .filter_map(|(addr, acc)| acc.map(|acc| (addr, acc)))
+        .map(|(address, acc)| ChangedAccount { address, nonce: acc.nonce, balance: acc.balance })
 }
 
 #[cfg(test)]

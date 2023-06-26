@@ -280,11 +280,7 @@ where
         InstructionResult::Continue
     }
 
-    fn step(
-        &mut self,
-        interp: &mut Interpreter,
-        data: &mut EVMData<'_, DB>,
-    ) -> InstructionResult {
+    fn step(&mut self, interp: &mut Interpreter, data: &mut EVMData<'_, DB>) -> InstructionResult {
         if self.step_fn.is_none() {
             return InstructionResult::Continue
         }
