@@ -2,8 +2,8 @@ use crate::tracing::{types::CallTraceNode, TracingInspectorConfig};
 use reth_primitives::{Address, U64};
 use reth_rpc_types::{trace::parity::*, TransactionInfo};
 use revm::{
-    db::DatabaseRef,
-    primitives::{AccountInfo, ExecutionResult, ResultAndState}, Database,
+    primitives::{AccountInfo, ExecutionResult, ResultAndState},
+    Database,
 };
 use std::collections::HashSet;
 

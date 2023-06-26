@@ -361,8 +361,8 @@ where
                         // next transaction
                         // TODO (rakita) revm state check if this is correct.
                         // if transactions.peek().is_some() {
-                        //     // need to apply the state changes of this transaction before executing
-                        //     // the next transaction
+                        //     // need to apply the state changes of this transaction before
+                        // executing     // the next transaction
                         //     db.commit(state)
                         // }
                     }

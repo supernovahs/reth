@@ -132,8 +132,7 @@ impl<'a> NewExecutor<'a> {
                 .sum();
 
             // return balance to DAO beneficiary.
-            *balance_increments.entry(DAO_HARDFORK_BENEFICIARY).or_default() +=
-                U256::from(drained_balance);
+            *balance_increments.entry(DAO_HARDFORK_BENEFICIARY).or_default() += drained_balance;
         }
 
         // increment balances

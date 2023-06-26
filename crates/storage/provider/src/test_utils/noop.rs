@@ -2,8 +2,8 @@ use crate::{
     change::BundleState,
     traits::{BlockSource, ReceiptProvider},
     AccountProvider, BlockHashProvider, BlockIdProvider, BlockNumProvider, BlockProvider,
-    BlockProviderIdExt, EvmEnvProvider, HeaderProvider, PostState, StageCheckpointReader,
-    StateProvider, StateProviderBox, StateProviderFactory, StateRootProvider, TransactionsProvider,
+    BlockProviderIdExt, EvmEnvProvider, HeaderProvider, StageCheckpointReader, StateProvider,
+    StateProviderBox, StateProviderFactory, StateRootProvider, TransactionsProvider,
     WithdrawalsProvider,
 };
 use reth_db::models::StoredBlockBodyIndices;

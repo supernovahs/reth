@@ -1,7 +1,7 @@
 //! Substate for blockchain trees
 
 use reth_primitives::{BlockHash, BlockNumber, ForkBlock};
-use reth_provider::{change::BundleState, post_state::PostState, PostStateDataProvider};
+use reth_provider::{change::BundleState, PostStateDataProvider};
 use std::collections::BTreeMap;
 
 /// Structure that bundles references of data needs to implement [`PostStateDataProvider`]

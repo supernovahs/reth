@@ -1,16 +1,17 @@
 use crate::{mode::MiningMode, Storage};
 use futures_util::{future::BoxFuture, FutureExt, StreamExt};
 use reth_beacon_consensus::BeaconEngineMessage;
-use reth_interfaces::consensus::ForkchoiceState;
+use reth_interfaces::{consensus::ForkchoiceState, executor::BlockExecutionError};
 use reth_primitives::{
     constants::{EMPTY_RECEIPTS, EMPTY_TRANSACTIONS},
     proofs,
     stage::StageId,
-    Block, BlockBody, ChainSpec, Header, IntoRecoveredTransaction, ReceiptWithBloom,
+    Address, Block, BlockBody, ChainSpec, Header, IntoRecoveredTransaction, ReceiptWithBloom,
     SealedBlockWithSenders, EMPTY_OMMER_ROOT, U256,
 };
 use reth_provider::{
-    BlockExecutor, CanonChainTracker, CanonStateNotificationSender, Chain, StateProviderFactory,
+    BlockExecutor, BundleState, CanonChainTracker, CanonStateNotificationSender, Chain,
+    StateProvider, StateProviderFactory,
 };
 use reth_revm::{database::State, new_executor::NewExecutor};
 use reth_stages::PipelineEvent;
@@ -167,25 +168,25 @@ where
                     let block =
                         Block { header, body: transactions, ommers: vec![], withdrawals: None };
 
-                    // execute the new block
-                    let substate = State::new(client.latest().unwrap());
-                    let mut executor = NewExecutor::new(chain_spec, substate);
-
-                    trace!(target: "consensus::auto", transactions=?&block.body, "executing transactions");
-
                     let senders = block
                         .body
                         .iter()
                         .map(|tx| tx.recover_signer())
                         .collect::<Option<Vec<_>>>()?;
 
-                    match executor.execute_transactions(&block, U256::ZERO, Some(senders.clone())) {
-                        Ok(gas_used) => {
+                    // execute the new block
+                    let state = client.latest().unwrap();
+                    //let mut executor = NewExecutor::new(chain_spec, substate);
+
+                    //trace!(target: "consensus::auto", transactions=?&block.body, "executing
+                    // transactions");
+
+                    match execute_block(&state, &block, Some(senders.clone()), chain_spec) {
+                        Ok((gas_used, bundle_state)) => {
                             // apply post block changes
-                            executor.post_execution_state_change(&block, U256::ZERO).unwrap();
+                            //executor.post_execution_state_change(&block, U256::ZERO).unwrap();
 
-                            let bundle_state = executor.take_output_state();
-
+                            //let bundle_state = executor.take_output_state();
                             let Block { mut header, body, .. } = block;
 
                             // clear all transactions from pool
@@ -280,6 +281,8 @@ where
                                 .send(reth_provider::CanonStateNotification::Commit { new: chain });
                         }
                         Err(err) => {
+                            //drop(substate);
+                            //drop(executor);
                             warn!(target: "consensus::auto", ?err, "failed to execute block")
                         }
                     }
@@ -309,4 +312,25 @@ impl<Client, Pool: TransactionPool> std::fmt::Debug for MiningTask<Client, Pool>
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MiningTask").finish_non_exhaustive()
     }
+}
+
+/// Create executor and execute blocks. This is solution to avoid sending database
+/// and to have temporary executor that does not need to implement Send.
+fn execute_block<SP: StateProvider>(
+    state: &SP,
+    block: &Block,
+    senders: Option<Vec<Address>>,
+    chain_spec: Arc<ChainSpec>,
+) -> Result<(u64, BundleState), BlockExecutionError> {
+    // execute the new block
+    let substate = State::new(state);
+    let mut executor = NewExecutor::new(chain_spec, substate);
+
+    //trace!(target: "consensus::auto", transactions=?&block.body, "executing transactions");
+
+    executor.execute_transactions(&block, U256::ZERO, senders).map(|gas| {
+        executor.post_execution_state_change(&block, U256::ZERO).unwrap();
+        let bundle_state = executor.take_output_state();
+        (gas, bundle_state)
+    })
 }

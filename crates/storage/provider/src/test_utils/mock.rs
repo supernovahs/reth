@@ -2,8 +2,8 @@ use crate::{
     change::BundleState,
     traits::{BlockSource, ReceiptProvider},
     AccountProvider, BlockHashProvider, BlockIdProvider, BlockNumProvider, BlockProvider,
-    BlockProviderIdExt, EvmEnvProvider, HeaderProvider, PostState, PostStateDataProvider,
-    StateProvider, StateProviderBox, StateProviderFactory, StateRootProvider, TransactionsProvider,
+    BlockProviderIdExt, EvmEnvProvider, HeaderProvider, PostStateDataProvider, StateProvider,
+    StateProviderBox, StateProviderFactory, StateRootProvider, TransactionsProvider,
     WithdrawalsProvider,
 };
 use parking_lot::Mutex;

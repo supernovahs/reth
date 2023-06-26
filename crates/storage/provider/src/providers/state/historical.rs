@@ -1,6 +1,6 @@
 use crate::{
     change::BundleState, providers::state::macros::delegate_provider_impls, AccountProvider,
-    BlockHashProvider, PostState, ProviderError, StateProvider, StateRootProvider,
+    BlockHashProvider, ProviderError, StateProvider, StateRootProvider,
 };
 use reth_db::{
     cursor::{DbCursorRO, DbDupCursorRO},

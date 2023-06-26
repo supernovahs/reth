@@ -279,7 +279,7 @@ where
                             .eth_api
                             .inspect_call_at(call, at, overrides, &mut inspector)
                             .await?;
-                        return Ok(FourByteFrame::from(inspector).into());
+                        return Ok(FourByteFrame::from(inspector).into())
                     }
                     GethDebugBuiltInTracerType::CallTracer => {
                         let call_config = tracer_config
@@ -298,7 +298,7 @@ where
 
                         let frame = inspector.into_geth_builder().geth_call_traces(call_config);
 
-                        return Ok(frame.into());
+                        return Ok(frame.into())
                     }
                     GethDebugBuiltInTracerType::PreStateTracer => {
                         Err(EthApiError::Unsupported("pre state tracer currently unsupported."))
@@ -325,7 +325,7 @@ where
                     let result = inspector.json_result(res, &env)?;
                     Ok(GethTrace::JS(result))
                 }
-            };
+            }
         }
 
         // default structlog tracer
@@ -362,7 +362,7 @@ where
                     GethDebugBuiltInTracerType::FourByteTracer => {
                         let mut inspector = FourByteInspector::default();
                         let (res, _) = inspect(db, env, &mut inspector)?;
-                        return Ok((FourByteFrame::from(inspector).into(), res.state));
+                        return Ok((FourByteFrame::from(inspector).into(), res.state))
                     }
                     GethDebugBuiltInTracerType::CallTracer => {
                         let call_config = tracer_config
@@ -377,7 +377,7 @@ where
 
                         let frame = inspector.into_geth_builder().geth_call_traces(call_config);
 
-                        return Ok((frame.into(), res.state));
+                        return Ok((frame.into(), res.state))
                     }
                     GethDebugBuiltInTracerType::PreStateTracer => {
                         Err(EthApiError::Unsupported("prestate tracer is unimplemented yet."))
@@ -401,7 +401,7 @@ where
                     let result = inspector.json_result(res, &env)?;
                     Ok((GethTrace::JS(result), state))
                 }
-            };
+            }
         }
 
         // default structlog tracer
@@ -449,7 +449,7 @@ where
             }
             Err(err) => {
                 let _ = on_ready.send(Err(err));
-                return;
+                return
             }
         };
 

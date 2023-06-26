@@ -1,6 +1,6 @@
 //! Dummy blocks and data for tests
 
-use crate::{post_state::PostState, DatabaseProviderRW};
+use crate::{BundleState, DatabaseProviderRW};
 use reth_db::{database::Database, models::StoredBlockBodyIndices, tables};
 use reth_primitives::{
     hex_literal::hex, Account, BlockNumber, Bytes, Header, Log, Receipt, SealedBlock,
@@ -53,7 +53,7 @@ pub struct BlockChainTestData {
     /// Genesis
     pub genesis: SealedBlock,
     /// Blocks with its execution result
-    pub blocks: Vec<(SealedBlockWithSenders, PostState)>,
+    pub blocks: Vec<(SealedBlockWithSenders, BundleState)>,
 }
 
 impl BlockChainTestData {
@@ -85,7 +85,7 @@ pub fn genesis() -> SealedBlock {
 }
 
 /// Block one that points to genesis
-fn block1(number: BlockNumber) -> (SealedBlockWithSenders, PostState) {
+fn block1(number: BlockNumber) -> (SealedBlockWithSenders, BundleState) {
     let mut block_rlp = hex!("f9025ff901f7a0c86e8cc0310ae7c531c758678ddbfd16fc51c8cef8cec650b032de9869e8b94fa01dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347942adc25665018aa1fe0e6bc666dac8fc2697ff9baa050554882fbbda2c2fd93fdc466db9946ea262a67f7a76cc169e714f105ab583da00967f09ef1dfed20c0eacfaa94d5cd4002eda3242ac47eae68972d07b106d192a0e3c8b47fbfc94667ef4cceb17e5cc21e3b1eebd442cebb27f07562b33836290db90100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000008302000001830f42408238108203e800a00000000000000000000000000000000000000000000000000000000000000000880000000000000000f862f860800a83061a8094095e7baea6a6c7c4c2dfeb977efac326af552d8780801ba072ed817487b84ba367d15d2f039b5fc5f087d0a8882fbdf73e8cb49357e1ce30a0403d800545b8fc544f92ce8124e2255f8c3c6af93f28243a120585d4c4c6a2a3c0").as_slice();
     let mut block = SealedBlock::decode(&mut block_rlp).unwrap();
     block.withdrawals = Some(vec![Withdrawal::default()]);
@@ -96,8 +96,9 @@ fn block1(number: BlockNumber) -> (SealedBlockWithSenders, PostState) {
     header.parent_hash = H256::zero();
     block.header = header.seal_slow();
 
-    let mut post_state = PostState::default();
+    let mut post_state = BundleState::default();
     // Transaction changes
+    /* TODO(rakita)
     post_state.create_account(
         number,
         H160([0x61; 20]),
@@ -127,12 +128,13 @@ fn block1(number: BlockNumber) -> (SealedBlockWithSenders, PostState) {
             }],
         },
     );
+    */
 
     (SealedBlockWithSenders { block, senders: vec![H160([0x30; 20])] }, post_state)
 }
 
 /// Block two that points to block 1
-fn block2(number: BlockNumber, parent_hash: H256) -> (SealedBlockWithSenders, PostState) {
+fn block2(number: BlockNumber, parent_hash: H256) -> (SealedBlockWithSenders, BundleState) {
     let mut block_rlp = hex!("f9025ff901f7a0c86e8cc0310ae7c531c758678ddbfd16fc51c8cef8cec650b032de9869e8b94fa01dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347942adc25665018aa1fe0e6bc666dac8fc2697ff9baa050554882fbbda2c2fd93fdc466db9946ea262a67f7a76cc169e714f105ab583da00967f09ef1dfed20c0eacfaa94d5cd4002eda3242ac47eae68972d07b106d192a0e3c8b47fbfc94667ef4cceb17e5cc21e3b1eebd442cebb27f07562b33836290db90100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000008302000001830f42408238108203e800a00000000000000000000000000000000000000000000000000000000000000000880000000000000000f862f860800a83061a8094095e7baea6a6c7c4c2dfeb977efac326af552d8780801ba072ed817487b84ba367d15d2f039b5fc5f087d0a8882fbdf73e8cb49357e1ce30a0403d800545b8fc544f92ce8124e2255f8c3c6af93f28243a120585d4c4c6a2a3c0").as_slice();
     let mut block = SealedBlock::decode(&mut block_rlp).unwrap();
     block.withdrawals = Some(vec![Withdrawal::default()]);
@@ -144,7 +146,8 @@ fn block2(number: BlockNumber, parent_hash: H256) -> (SealedBlockWithSenders, Po
     header.parent_hash = parent_hash;
     block.header = header.seal_slow();
 
-    let mut post_state = PostState::default();
+    let mut post_state = BundleState::default();
+    /* TODO(rakita) revm state
     // block changes
     post_state.change_account(
         number,
@@ -170,6 +173,6 @@ fn block2(number: BlockNumber, parent_hash: H256) -> (SealedBlockWithSenders, Po
             }],
         },
     );
-
+     */
     (SealedBlockWithSenders { block, senders: vec![H160([0x31; 20])] }, post_state)
 }

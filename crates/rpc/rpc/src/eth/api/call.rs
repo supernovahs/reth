@@ -126,7 +126,7 @@ where
             let mut available_funds =
                 db.basic(env.tx.caller)?.map(|acc| acc.balance).unwrap_or_default();
             if env.tx.value > available_funds {
-                return Err(RpcInvalidTransactionError::InsufficientFunds.into());
+                return Err(RpcInvalidTransactionError::InsufficientFunds.into())
             }
             // subtract transferred value from available funds
             // SAFETY: value < available_funds, checked above
@@ -157,7 +157,7 @@ where
             // if price or limit was included in the request then we can execute the request
             // again with the block's gas limit to check if revert is gas related or not
             if request_gas.is_some() || request_gas_price.is_some() {
-                return Err(map_out_of_gas_err::<S>(env_gas_limit, env, &mut db));
+                return Err(map_out_of_gas_err::<S>(env_gas_limit, env, &mut db))
             }
         }
 
@@ -177,7 +177,7 @@ where
                 } else {
                     // the transaction did revert
                     Err(RpcInvalidTransactionError::Revert(RevertError::new(output)).into())
-                };
+                }
             }
         }
 
@@ -214,7 +214,7 @@ where
 
                 // new midpoint
                 mid_gas_limit = ((highest_gas_limit as u128 + lowest_gas_limit as u128) / 2) as u64;
-                continue;
+                continue
             }
 
             let (res, _) = ethres?;
@@ -236,7 +236,7 @@ where
                         err => {
                             // these should be unreachable because we know the transaction succeeds,
                             // but we consider these cases an error
-                            return Err(RpcInvalidTransactionError::EvmHalt(err).into());
+                            return Err(RpcInvalidTransactionError::EvmHalt(err).into())
                         }
                     }
                 }

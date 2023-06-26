@@ -17,7 +17,7 @@ pub fn post_block_balance_increments(
     total_difficulty: U256,
     ommers: &[Header],
     withdrawals: Option<&[Withdrawal]>,
-) -> HashMap<Address, U256> {
+) -> HashMap<Address, u128> {
     let mut balance_increments = HashMap::new();
 
     // Add block rewards if they are enabled.
@@ -53,7 +53,7 @@ pub fn post_block_withdrawals_balance_increments(
     chain_spec: &ChainSpec,
     block_timestamp: u64,
     withdrawals: &[Withdrawal],
-) -> HashMap<Address, U256> {
+) -> HashMap<Address, u128> {
     let mut balance_increments = HashMap::with_capacity(withdrawals.len());
     insert_post_block_withdrawals_balance_increments(
         chain_spec,
@@ -71,7 +71,7 @@ pub fn insert_post_block_withdrawals_balance_increments(
     chain_spec: &ChainSpec,
     block_timestamp: u64,
     withdrawals: Option<&[Withdrawal]>,
-    balance_increments: &mut HashMap<Address, U256>,
+    balance_increments: &mut HashMap<Address, u128>,
 ) {
     // Process withdrawals
     if chain_spec.fork(Hardfork::Shanghai).active_at_timestamp(block_timestamp) {

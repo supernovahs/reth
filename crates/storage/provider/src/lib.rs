@@ -27,10 +27,6 @@ pub use providers::{
     HistoricalStateProviderRef, LatestStateProvider, LatestStateProviderRef, ProviderFactory,
 };
 
-/// Execution result
-pub mod post_state;
-pub use post_state::PostState;
-
 /// Helper types for interacting with the database
 mod transaction;
 pub use transaction::TransactionError;

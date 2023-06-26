@@ -10,6 +10,7 @@
 use crate::metrics::PayloadBuilderMetrics;
 use futures_core::ready;
 use futures_util::{sink::With, FutureExt};
+use reth_interfaces::Error;
 use reth_payload_builder::{
     database::CachedReads, error::PayloadBuilderError, BuiltPayload, KeepPayloadJobAlive,
     PayloadBuilderAttributes, PayloadJob, PayloadJobGenerator,
@@ -20,12 +21,10 @@ use reth_primitives::{
         BEACON_NONCE, EMPTY_RECEIPTS, EMPTY_TRANSACTIONS, EMPTY_WITHDRAWALS, RETH_CLIENT_VERSION,
         SLOT_DURATION,
     },
-    proofs, Block, BlockNumberOrTag, ChainSpec, Header, IntoRecoveredTransaction, Receipt,
+    proofs, Block, BlockNumberOrTag, Bloom, ChainSpec, Header, IntoRecoveredTransaction, Receipt,
     SealedBlock, Withdrawal, EMPTY_OMMER_ROOT, H256, U256,
 };
-use reth_provider::{
-    BlockProviderIdExt, BlockSource, BundleState, PostState, StateProviderFactory,
-};
+use reth_provider::{BlockProviderIdExt, BlockSource, BundleState, StateProviderFactory};
 use reth_revm::{
     database::State, env::tx_env_with_recovered, into_reth_log, revm::State as RevmState,
     state_change::post_block_withdrawals_balance_increments,
@@ -34,8 +33,9 @@ use reth_rlp::Encodable;
 use reth_tasks::TaskSpawner;
 use reth_transaction_pool::TransactionPool;
 use revm::{
-    db::{BundleAccount, CacheDB, DatabaseRef},
+    db::{BundleAccount, CacheDB, DatabaseRef, RefDBWrapper, WrapDatabaseRef},
     primitives::{BlockEnv, CfgEnv, EVMError, Env, InvalidTransaction, ResultAndState},
+    DatabaseCommit,
 };
 use std::{
     future::Future,
@@ -282,7 +282,7 @@ where
         // check if the deadline is reached
         if this.deadline.as_mut().poll(cx).is_ready() {
             trace!("Payload building deadline reached");
-            return Poll::Ready(Ok(()));
+            return Poll::Ready(Ok(()))
         }
 
         // check if the interval is reached
@@ -363,7 +363,7 @@ where
 
     fn best_payload(&self) -> Result<Arc<BuiltPayload>, PayloadBuilderError> {
         if let Some(ref payload) = self.best_payload {
-            return Ok(payload.clone());
+            return Ok(payload.clone())
         }
         // No payload has been built yet, but we need to return something that the CL then can
         // deliver, so we need to return an empty payload.
@@ -431,13 +431,13 @@ impl Future for ResolveBestPayload {
             if let Poll::Ready(res) = fut.poll(cx) {
                 this.maybe_better = None;
                 if let Ok(BuildOutcome::Better { payload, .. }) = res {
-                    return Poll::Ready(Ok(Arc::new(payload)));
+                    return Poll::Ready(Ok(Arc::new(payload)))
                 }
             }
         }
 
         if let Some(best) = this.best_payload.take() {
-            return Poll::Ready(Ok(best));
+            return Poll::Ready(Ok(best))
         }
 
         let mut empty_payload = this.empty_payload.take().expect("polled after completion");
@@ -565,8 +565,10 @@ fn build_payload<Pool, Client>(
         debug!(parent_hash=?parent_block.hash, parent_number=parent_block.number, "building new payload");
 
         let state = State::new(client.state_by_block_hash(parent_block.hash)?);
-        let mut db = CacheDB::new(cached_reads.as_db(&state));
-        let mut post_state = PostState::default();
+        let wrapped_state = WrapDatabaseRef(cached_reads.as_db(&state));
+        let mut db = RevmState::new_with_transition(Box::new(wrapped_state));
+        // TODO(rakita) revm state.
+        let mut bundle_state = BundleState::default();
 
         let mut cumulative_gas_used = 0;
         let block_gas_limit: u64 = initialized_block_env.gas_limit.try_into().unwrap_or(u64::MAX);
@@ -586,12 +588,12 @@ fn build_payload<Pool, Client>(
                 // which also removes all dependent transaction from the iterator before we can
                 // continue
                 best_txs.mark_invalid(&pool_tx);
-                continue;
+                continue
             }
 
             // check if the job was cancelled, if so we can exit early
             if cancel.is_cancelled() {
-                return Ok(BuildOutcome::Cancelled);
+                return Ok(BuildOutcome::Cancelled)
             }
 
             // convert tx to a signed transaction
@@ -625,11 +627,11 @@ fn build_payload<Pool, Client>(
                                 );
                                 best_txs.mark_invalid(&pool_tx);
                             }
-                            continue;
+                            continue
                         }
                         err => {
                             // this is an error that we should treat as fatal for this attempt
-                            return Err(PayloadBuilderError::EvmExecutionError(err));
+                            return Err(PayloadBuilderError::EvmExecutionError(err))
                         }
                     }
                 }
@@ -639,21 +641,24 @@ fn build_payload<Pool, Client>(
 
             // commit changes
             // TODO
+            evm.db.unwrap().commit(state);
+            //ev,.db.unwrap().t
             //commit_state_changes(&mut db, &mut post_state, block_number, state, true);
 
             // add gas used by the transaction to cumulative gas used, before creating the receipt
             cumulative_gas_used += gas_used;
 
             // Push transaction changeset and calculate header bloom filter for receipt.
-            post_state.add_receipt(
-                block_number,
-                Receipt {
-                    tx_type: tx.tx_type(),
-                    success: result.is_success(),
-                    cumulative_gas_used,
-                    logs: result.logs().into_iter().map(into_reth_log).collect(),
-                },
-            );
+            // TODO(rakita) revm state
+            // post_state.add_receipt(
+            //     block_number,
+            //     Receipt {
+            //         tx_type: tx.tx_type(),
+            //         success: result.is_success(),
+            //         cumulative_gas_used,
+            //         logs: result.logs().into_iter().map(into_reth_log).collect(),
+            //     },
+            // );
 
             // update add to total fees
             let miner_fee = tx
@@ -668,23 +673,20 @@ fn build_payload<Pool, Client>(
         // check if we have a better block
         if !is_better_payload(best_payload.as_deref(), total_fees) {
             // can skip building the block
-            return Ok(BuildOutcome::Aborted { fees: total_fees, cached_reads });
+            drop(db);
+            return Ok(BuildOutcome::Aborted { fees: total_fees, cached_reads })
         }
 
-        let WithdrawalsOutcome { withdrawals_root, withdrawals } = WithdrawalsOutcome::default();
-        /* TODO(rakita) revm state
-        commit_withdrawals(
-            &mut db,
-            &mut post_state,
-            &chain_spec,
-            block_number,
-            attributes.timestamp,
-            attributes.withdrawals,
-        )?;
-         */
+        let WithdrawalsOutcome { withdrawals_root, withdrawals } =
+            commit_withdrawals(&mut db, &chain_spec, attributes.timestamp, attributes.withdrawals)?;
 
-        let receipts_root = post_state.receipts_root(block_number);
-        let logs_bloom = post_state.logs_bloom(block_number);
+        // calculate the state root
+        let bundle_state = BundleState::new(db.take_bundle(), vec![], block_number);
+        let state_root = state.0.state_root(bundle_state)?;
+
+        // TODO(rakita) state
+        let receipts_root = H256::default(); //bundle_state.receipts_root(block_number);
+        let logs_bloom = Bloom::default(); //bundle_state.logs_bloom(block_number);
 
         // calculate the state root
         // TODO (rakita) revm state
@@ -718,6 +720,7 @@ fn build_payload<Pool, Client>(
         let block = Block { header, body: executed_txs, ommers: vec![], withdrawals };
 
         let sealed_block = block.seal_slow();
+        drop(db);
         Ok(BuildOutcome::Better {
             payload: BuiltPayload::new(attributes.id, sealed_block, total_fees),
             cached_reads,
@@ -746,29 +749,18 @@ where
     debug!(parent_hash=?parent_block.hash, parent_number=parent_block.number,  "building empty payload");
 
     let state = client.state_by_block_hash(parent_block.hash)?;
-    let mut db = State::new(state);
-    let mut bundle_state = BundleState::default();
+    let mut db = RevmState::new_with_transition(Box::new(State::new(&state)));
 
     let base_fee = initialized_block_env.basefee.to::<u64>();
     let block_number = initialized_block_env.number.to::<u64>();
     let block_gas_limit: u64 = initialized_block_env.gas_limit.try_into().unwrap_or(u64::MAX);
 
-    let WithdrawalsOutcome { withdrawals_root, withdrawals } = WithdrawalsOutcome::default();
-    /* TODO (rakita) revm state
-    commit_withdrawals(
-        &mut db,
-        &mut bundle_state,
-        &chain_spec,
-        block_number,
-        attributes.timestamp,
-        attributes.withdrawals,
-    )?;
-    */
+    let WithdrawalsOutcome { withdrawals_root, withdrawals } =
+        commit_withdrawals(&mut db, &chain_spec, attributes.timestamp, attributes.withdrawals)?;
 
     // calculate the state root
-    // TODO (rakita) revm state
-    //let state_root = db.0.state_root(bundle_state)?;
-    let state_root = H256::zero();
+    let bundle_state = BundleState::new(db.take_bundle(), vec![], block_number);
+    let state_root = state.state_root(bundle_state)?;
 
     let header = Header {
         parent_hash: parent_block.hash,
@@ -821,33 +813,26 @@ impl WithdrawalsOutcome {
 ///
 /// Returns `None` values pre shanghai
 #[allow(clippy::too_many_arguments)]
-fn commit_withdrawals<DB>(
-    db: &mut RevmState<'_, DB::Error>,
-    bundle_state: &mut BundleState,
+fn commit_withdrawals(
+    db: &mut RevmState<'_, Error>,
     chain_spec: &ChainSpec,
-    block_number: u64,
     timestamp: u64,
     withdrawals: Vec<Withdrawal>,
-) -> Result<WithdrawalsOutcome, <DB as DatabaseRef>::Error>
-where
-    DB: DatabaseRef,
-{
+) -> Result<WithdrawalsOutcome, Error> {
     if !chain_spec.is_shanghai_activated_at_timestamp(timestamp) {
-        return Ok(WithdrawalsOutcome::pre_shanghai());
+        return Ok(WithdrawalsOutcome::pre_shanghai())
     }
 
     if withdrawals.is_empty() {
-        return Ok(WithdrawalsOutcome::empty());
+        return Ok(WithdrawalsOutcome::empty())
     }
 
     let balance_increments =
         post_block_withdrawals_balance_increments(chain_spec, timestamp, &withdrawals);
 
-    for (address, increment) in balance_increments {
-        // TODO (rakita) revm state increment balance
-        //bundle_state.
-        //increment_account_balance(db, post_state, block_number, address, increment)?;
-    }
+    db.increment_balances(balance_increments.into_iter())?;
+    // merge transition, this would apply the balance changes.
+    db.merge_transitions();
 
     let withdrawals_root = proofs::calculate_withdrawals_root(&withdrawals);
 

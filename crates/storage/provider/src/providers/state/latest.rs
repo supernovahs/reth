@@ -1,6 +1,6 @@
 use crate::{
     change::BundleState, providers::state::macros::delegate_provider_impls, AccountProvider,
-    BlockHashProvider, PostState, StateProvider, StateRootProvider,
+    BlockHashProvider, StateProvider, StateRootProvider,
 };
 use reth_db::{
     cursor::{DbCursorRO, DbDupCursorRO},
@@ -56,7 +56,7 @@ impl<'a, 'b, TX: DbTx<'a>> BlockHashProvider for LatestStateProviderRef<'a, 'b, 
 }
 
 impl<'a, 'b, TX: DbTx<'a>> StateRootProvider for LatestStateProviderRef<'a, 'b, TX> {
-    fn state_root(&self, post_state: BundleState) -> Result<H256> {
+    fn state_root(&self, _bundle_state: BundleState) -> Result<H256> {
         // TODO add state root calculation
         //post_state
         //    .state_root_slow(self.db)

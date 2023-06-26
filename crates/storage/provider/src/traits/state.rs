@@ -1,5 +1,5 @@
 use super::AccountProvider;
-use crate::{change::BundleState, post_state::PostState, BlockHashProvider, BlockIdProvider};
+use crate::{change::BundleState, BlockHashProvider, BlockIdProvider};
 use auto_impl::auto_impl;
 use reth_interfaces::{provider::ProviderError, Result};
 use reth_primitives::{

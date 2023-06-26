@@ -1336,8 +1336,8 @@ mod tests {
     use crate::engine::error::BeaconForkChoiceUpdateError;
     use assert_matches::assert_matches;
     use reth_blockchain_tree::{
-        config::BlockchainTreeConfig, externals::TreeExternals, post_state::PostState,
-        BlockchainTree, ShareableBlockchainTree,
+        config::BlockchainTreeConfig, externals::TreeExternals, BlockchainTree,
+        ShareableBlockchainTree,
     };
     use reth_db::mdbx::{test_utils::create_test_rw_db, Env, WriteMap};
     use reth_interfaces::{

@@ -3,7 +3,7 @@
 //! A [`Chain`] contains the state of accounts for the chain after execution of its constituent
 //! blocks, as well as a list of the blocks the chain is composed of.
 use super::externals::TreeExternals;
-use crate::{post_state::PostState, PostStateDataRef};
+use crate::PostStateDataRef;
 use reth_db::database::Database;
 use reth_interfaces::{
     blockchain_tree::error::{BlockchainTreeError, InsertBlockError},
@@ -14,7 +14,7 @@ use reth_primitives::{
     BlockHash, BlockNumber, ForkBlock, SealedBlockWithSenders, SealedHeader, U256,
 };
 use reth_provider::{
-    change::BundleState, providers::PostStateProvider, BlockExecutor, Chain, ExecutorFactory,
+    change::BundleState, providers::PostStateProvider, Chain, ExecutorFactory,
     PostStateDataProvider, StateRootProvider,
 };
 use std::{

@@ -1,10 +1,9 @@
 use crate::{
-    change::BundleState, AccountProvider, BlockHashProvider, PostState, PostStateDataProvider,
-    StateProvider, StateRootProvider,
+    change::BundleState, AccountProvider, BlockHashProvider, PostStateDataProvider, StateProvider,
+    StateRootProvider,
 };
 use reth_interfaces::{provider::ProviderError, Result};
-use reth_primitives::{Account, Address, BlockNumber, Bytecode, Bytes, H256, U256};
-use reth_revm_primitives::db::BundleAccount;
+use reth_primitives::{Account, Address, BlockNumber, Bytecode, Bytes, H256};
 
 /// A state provider that either resolves to data in a wrapped [`crate::PostState`], or an
 /// underlying state provider.

@@ -6,7 +6,7 @@ use reth_db::{
     transaction::{DbTx, DbTxMut},
 };
 use reth_primitives::{stage::StageId, Account, Bytecode, ChainSpec, H256, U256};
-use reth_provider::{DatabaseProviderRW, PostState, ProviderFactory, TransactionError};
+use reth_provider::{BundleState, DatabaseProviderRW, ProviderFactory, TransactionError};
 use std::{path::Path, sync::Arc};
 use tracing::debug;
 
@@ -96,8 +96,10 @@ pub fn insert_genesis_state<DB: Database>(
     tx: &<DB as DatabaseGAT<'_>>::TXMut,
     genesis: &reth_primitives::Genesis,
 ) -> Result<(), InitDatabaseError> {
-    let mut state = PostState::default();
+    let mut state = BundleState::default();
 
+    // TODO(rakita) bundle state;
+    /*
     for (address, account) in &genesis.alloc {
         let mut bytecode_hash = None;
         if let Some(code) = &account.code {
@@ -122,6 +124,7 @@ pub fn insert_genesis_state<DB: Database>(
         }
     }
     state.write_to_db(tx)?;
+     */
 
     Ok(())
 }

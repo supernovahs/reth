@@ -20,7 +20,6 @@ use reth_primitives::{
 };
 use reth_provider::{
     chain::{ChainSplit, SplitAt},
-    post_state::PostState,
     BlockNumProvider, BundleState, CanonStateNotification, CanonStateNotificationSender,
     CanonStateNotifications, Chain, DatabaseProvider, ExecutorFactory, HeaderProvider,
 };
