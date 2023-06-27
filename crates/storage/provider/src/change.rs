@@ -1,5 +1,5 @@
 //! Wrapper around revms state.
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use reth_db::{
     cursor::{DbCursorRO, DbCursorRW, DbDupCursorRO, DbDupCursorRW},
@@ -8,7 +8,10 @@ use reth_db::{
     transaction::{DbTx, DbTxMut},
 };
 use reth_interfaces::db::DatabaseError;
-use reth_primitives::{Account, Address, BlockNumber, Bytecode, Receipt, StorageEntry, H256, U256};
+use reth_primitives::{
+    bloom::logs_bloom, keccak256, proofs::calculate_receipt_root_ref, Account, Address,
+    BlockNumber, Bloom, Bytecode, Log, Receipt, StorageEntry, H256, U256,
+};
 use reth_revm_primitives::{
     db::states::{
         BundleState as RevmBundleState, StateChangeset as RevmChange, StateReverts as RevmReverts,
@@ -16,6 +19,10 @@ use reth_revm_primitives::{
     into_reth_acc, into_revm_acc,
     primitives::AccountInfo,
     to_reth_acc,
+};
+use reth_trie::{
+    hashed_cursor::{HashedPostState, HashedPostStateCursorFactory, HashedStorage},
+    StateRoot, StateRootError,
 };
 
 /// Bundle state of post execution changes and reverts
@@ -70,6 +77,106 @@ impl BundleState {
         self.bundle.bytecode(code_hash).map(|b| Bytecode(b))
     }
 
+    /// Hash all changed accounts and storage entries that are currently stored in the post state.
+    ///
+    /// # Returns
+    ///
+    /// The hashed post state.
+    fn hash_state_slow(&self) -> HashedPostState {
+        let mut accounts = BTreeMap::default();
+        let mut storages = BTreeMap::default();
+        for (address, account) in self.bundle.state() {
+            let hashed_address = keccak256(address);
+            accounts.insert(hashed_address, account.info.as_ref().map(to_reth_acc));
+
+            // insert storage.
+            let mut hashed_storage = BTreeMap::default();
+            for (key, value) in account.storage.iter() {
+                let hashed_key = keccak256(H256(key.to_be_bytes()));
+                hashed_storage.insert(hashed_key, value.present_value);
+            }
+            let wiped = account.status.was_destroyed();
+            storages.insert(hashed_address, HashedStorage { wiped, storage: hashed_storage });
+        }
+        HashedPostState { accounts, storages }
+    }
+
+    /// Calculate the state root for this [PostState].
+    /// Internally, function calls [Self::hash_state_slow] to obtain the [HashedPostState].
+    /// Afterwards, it retrieves the prefixsets from the [HashedPostState] and uses them to
+    /// calculate the incremental state root.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use reth_primitives::{Address, Account};
+    /// use reth_provider::PostState;
+    /// use reth_db::{mdbx::{EnvKind, WriteMap, test_utils::create_test_db}, database::Database};
+    ///
+    /// // Initialize the database
+    /// let db = create_test_db::<WriteMap>(EnvKind::RW);
+    ///
+    /// // Initialize the post state
+    /// let mut post_state = PostState::new();
+    ///
+    /// // Create an account
+    /// let block_number = 1;
+    /// let address = Address::random();
+    /// post_state.create_account(1, address, Account { nonce: 1, ..Default::default() });
+    ///
+    /// // Calculate the state root
+    /// let tx = db.tx().expect("failed to create transaction");
+    /// let state_root = post_state.state_root_slow(&tx);
+    /// ```
+    ///
+    /// # Returns
+    ///
+    /// The state root for this [PostState].
+    pub fn state_root_slow<'a, 'tx, TX: DbTx<'tx>>(
+        &self,
+        tx: &'a TX,
+    ) -> Result<H256, StateRootError> {
+        let hashed_post_state = self.hash_state_slow();
+        let (account_prefix_set, storage_prefix_set) = hashed_post_state.construct_prefix_sets();
+        let hashed_cursor_factory = HashedPostStateCursorFactory::new(tx, &hashed_post_state);
+        StateRoot::new(tx)
+            .with_hashed_cursor_factory(&hashed_cursor_factory)
+            .with_changed_account_prefixes(account_prefix_set)
+            .with_changed_storage_prefixes(storage_prefix_set)
+            .root()
+    }
+
+    /// Transform block number to the index of block.
+    fn block_number_to_index(&self, block_number: BlockNumber) -> Option<usize> {
+        if block_number > self.first_block {
+            return None
+        }
+        let index = block_number - self.first_block;
+        if index > self.receipts.len() as u64 {
+            return None
+        }
+        Some(index as usize)
+    }
+
+    /// Returns an iterator over all block logs.
+    pub fn logs(&self, block_number: BlockNumber) -> Option<impl Iterator<Item = &Log>> {
+        let index = self.block_number_to_index(block_number)?;
+        Some(self.receipts[index].iter().flat_map(|r| r.logs.iter()))
+    }
+
+    /// Return blocks logs bloom
+    pub fn block_logs_bloom(&self, block_number: BlockNumber) -> Option<Bloom> {
+        Some(logs_bloom(self.logs(block_number)?))
+    }
+
+    /// Returns the receipt root for all recorded receipts.
+    /// Note: this function calculated Bloom filters for every receipt and created merkle trees
+    /// of receipt. This is a expensive operation.
+    pub fn receipts_root_slow(&self, block_number: BlockNumber) -> Option<H256> {
+        let index = self.block_number_to_index(block_number)?;
+        Some(calculate_receipt_root_ref(&self.receipts[index]))
+    }
+
     /// Create new bundle state with receipts.
     pub fn new_init(
         bundle_init: BundleStateInit,
@@ -100,10 +207,8 @@ impl BundleState {
 
     /// Return all block receipts
     pub fn receipts_by_block(&self, block_number: BlockNumber) -> &[Receipt] {
-        if block_number < self.first_block || block_number > self.last_block() {
-            return &[]
-        }
-        self.receipts[(block_number - self.first_block) as usize].as_slice()
+        let Some(index) = self.block_number_to_index(block_number) else { return &[] };
+        self.receipts[index].as_slice()
     }
 
     /// Number of blocks in bundle state.
@@ -125,17 +230,10 @@ impl BundleState {
     ///
     /// Note: Give Block number will stay inside the bundle state.
     pub fn revert_to(&mut self, block_number: BlockNumber) {
-        let last_block = self.last_block();
-        let first_block = self.first_block;
-        if block_number >= last_block {
-            return
-        }
-        if block_number < first_block {
-            return
-        }
+        let Some(index) = self.block_number_to_index(block_number) else { return };
 
-        let rm_trx = (last_block - block_number) as usize;
-        let new_len = self.len() - rm_trx;
+        let rm_trx = self.receipts.len() - index;
+        let new_len = self.len() - index;
 
         // remove receipts
         self.receipts.truncate(new_len);

@@ -56,12 +56,10 @@ impl<'a, 'b, TX: DbTx<'a>> BlockHashProvider for LatestStateProviderRef<'a, 'b, 
 }
 
 impl<'a, 'b, TX: DbTx<'a>> StateRootProvider for LatestStateProviderRef<'a, 'b, TX> {
-    fn state_root(&self, _bundle_state: BundleState) -> Result<H256> {
-        // TODO add state root calculation
-        //post_state
-        //    .state_root_slow(self.db)
-        //    .map_err(|err| reth_interfaces::Error::Database(err.into()))
-        Ok(H256::zero())
+    fn state_root(&self, bundle_state: BundleState) -> Result<H256> {
+        bundle_state
+            .state_root_slow(self.db)
+            .map_err(|err| reth_interfaces::Error::Database(err.into()))
     }
 }
 

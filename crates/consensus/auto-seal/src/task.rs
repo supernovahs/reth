@@ -281,8 +281,6 @@ where
                                 .send(reth_provider::CanonStateNotification::Commit { new: chain });
                         }
                         Err(err) => {
-                            //drop(substate);
-                            //drop(executor);
                             warn!(target: "consensus::auto", ?err, "failed to execute block")
                         }
                     }

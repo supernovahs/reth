@@ -9,7 +9,7 @@
 
 use crate::metrics::PayloadBuilderMetrics;
 use futures_core::ready;
-use futures_util::{sink::With, FutureExt};
+use futures_util::FutureExt;
 use reth_interfaces::Error;
 use reth_payload_builder::{
     database::CachedReads, error::PayloadBuilderError, BuiltPayload, KeepPayloadJobAlive,
@@ -21,7 +21,7 @@ use reth_primitives::{
         BEACON_NONCE, EMPTY_RECEIPTS, EMPTY_TRANSACTIONS, EMPTY_WITHDRAWALS, RETH_CLIENT_VERSION,
         SLOT_DURATION,
     },
-    proofs, Block, BlockNumberOrTag, Bloom, ChainSpec, Header, IntoRecoveredTransaction, Receipt,
+    proofs, Block, BlockNumberOrTag, ChainSpec, Header, IntoRecoveredTransaction, Receipt,
     SealedBlock, Withdrawal, EMPTY_OMMER_ROOT, H256, U256,
 };
 use reth_provider::{BlockProviderIdExt, BlockSource, BundleState, StateProviderFactory};
@@ -33,7 +33,7 @@ use reth_rlp::Encodable;
 use reth_tasks::TaskSpawner;
 use reth_transaction_pool::TransactionPool;
 use revm::{
-    db::{BundleAccount, CacheDB, DatabaseRef, RefDBWrapper, WrapDatabaseRef},
+    db::WrapDatabaseRef,
     primitives::{BlockEnv, CfgEnv, EVMError, Env, InvalidTransaction, ResultAndState},
     DatabaseCommit,
 };
@@ -567,8 +567,6 @@ fn build_payload<Pool, Client>(
         let state = State::new(client.state_by_block_hash(parent_block.hash)?);
         let wrapped_state = WrapDatabaseRef(cached_reads.as_db(&state));
         let mut db = RevmState::new_with_transition(Box::new(wrapped_state));
-        // TODO(rakita) revm state.
-        let mut bundle_state = BundleState::default();
 
         let mut cumulative_gas_used = 0;
         let block_gas_limit: u64 = initialized_block_env.gas_limit.try_into().unwrap_or(u64::MAX);
@@ -580,6 +578,8 @@ fn build_payload<Pool, Client>(
         let base_fee = initialized_block_env.basefee.to::<u64>();
 
         let block_number = initialized_block_env.number.to::<u64>();
+
+        let mut receipts = Vec::new();
 
         while let Some(pool_tx) = best_txs.next() {
             // ensure we still have capacity for this transaction
@@ -649,16 +649,12 @@ fn build_payload<Pool, Client>(
             cumulative_gas_used += gas_used;
 
             // Push transaction changeset and calculate header bloom filter for receipt.
-            // TODO(rakita) revm state
-            // post_state.add_receipt(
-            //     block_number,
-            //     Receipt {
-            //         tx_type: tx.tx_type(),
-            //         success: result.is_success(),
-            //         cumulative_gas_used,
-            //         logs: result.logs().into_iter().map(into_reth_log).collect(),
-            //     },
-            // );
+            receipts.push(Receipt {
+                tx_type: tx.tx_type(),
+                success: result.is_success(),
+                cumulative_gas_used,
+                logs: result.logs().into_iter().map(into_reth_log).collect(),
+            });
 
             // update add to total fees
             let miner_fee = tx
@@ -681,17 +677,14 @@ fn build_payload<Pool, Client>(
             commit_withdrawals(&mut db, &chain_spec, attributes.timestamp, attributes.withdrawals)?;
 
         // calculate the state root
-        let bundle_state = BundleState::new(db.take_bundle(), vec![], block_number);
+        let bundle_state = BundleState::new(db.take_bundle(), vec![receipts], block_number);
+
+        let receipts_root =
+            bundle_state.receipts_root_slow(block_number).expect("Block number is valid");
+        let logs_bloom =
+            bundle_state.block_logs_bloom(block_number).expect("Block number is valid");
+
         let state_root = state.0.state_root(bundle_state)?;
-
-        // TODO(rakita) state
-        let receipts_root = H256::default(); //bundle_state.receipts_root(block_number);
-        let logs_bloom = Bloom::default(); //bundle_state.logs_bloom(block_number);
-
-        // calculate the state root
-        // TODO (rakita) revm state
-        //let state_root = state.state().state_root(post_state)?;
-        let state_root = H256::zero();
 
         // create the block header
         let transactions_root = proofs::calculate_transaction_root(&executed_txs);
