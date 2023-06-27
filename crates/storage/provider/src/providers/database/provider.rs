@@ -1,10 +1,9 @@
 use crate::{
     change::{BundleState, BundleStateInit},
-    insert_canonical_block,
-    traits::{AccountExtProvider, BlockSource, ReceiptProvider, StageCheckpointWriter},
-    AccountProvider, BlockHashProvider, BlockNumProvider, BlockProvider, Chain, EvmEnvProvider,
-    HeaderProvider, ProviderError, StageCheckpointReader, TransactionError, TransactionsProvider,
-    WithdrawalsProvider,
+    traits::{AccountExtReader, BlockSource, ReceiptProvider, StageCheckpointWriter},
+    AccountReader, BlockExecutionWriter, BlockHashReader, BlockNumReader, BlockReader, BlockWriter,
+    Chain, EvmEnvProvider, HashingWriter, HeaderProvider, HistoryWriter, ProviderError,
+    StageCheckpointReader, StorageReader, TransactionsProvider, WithdrawalsProvider,
 };
 use itertools::{izip, Itertools};
 use reth_db::{
@@ -12,13 +11,12 @@ use reth_db::{
     cursor::{DbCursorRO, DbCursorRW, DbDupCursorRO},
     database::{Database, DatabaseGAT},
     models::{
-        sharded_key,
-        storage_sharded_key::{self, StorageShardedKey},
-        AccountBeforeTx, BlockNumberAddress, ShardedKey, StoredBlockBodyIndices,
+        sharded_key, storage_sharded_key::StorageShardedKey, AccountBeforeTx, BlockNumberAddress,
+        ShardedKey, StoredBlockBodyIndices, StoredBlockOmmers, StoredBlockWithdrawals,
     },
     table::Table,
     tables,
-    transaction::{DbTx, DbTxMut, DbTxMutGAT},
+    transaction::{DbTx, DbTxMut},
     BlockNumberList, DatabaseError,
 };
 use reth_interfaces::Result;
@@ -82,7 +80,7 @@ impl<'this, DB: Database> DatabaseProviderRW<'this, DB> {
 }
 
 /// A provider struct that fetchs data from the database.
-/// Wrapper around [`DbTx`] and [`DbTxMut`]. Example: [`HeaderProvider`] [`BlockHashProvider`]
+/// Wrapper around [`DbTx`] and [`DbTxMut`]. Example: [`HeaderProvider`] [`BlockHashReader`]
 #[derive(Debug)]
 pub struct DatabaseProvider<'this, TX>
 where
@@ -102,75 +100,51 @@ impl<'this, TX: DbTxMut<'this>> DatabaseProvider<'this, TX> {
     }
 }
 
-/// Unwind all history shards. For boundary shard, remove it from database and
-/// return last part of shard with still valid items. If all full shard were removed, return list
-/// would be empty.
-fn unwind_account_history_shards<'a, TX: reth_db::transaction::DbTxMutGAT<'a>>(
-    cursor: &mut <TX as DbTxMutGAT<'a>>::CursorMut<tables::AccountHistory>,
-    address: Address,
+/// For a given key, unwind all history shards that are below the given block number.
+///
+/// S - Sharded key subtype.
+/// T - Table to walk over.
+/// C - Cursor implementation.
+///
+/// This function walks the entries from the given start key and deletes all shards that belong to
+/// the key and are below the given block number.
+///
+/// The boundary shard (the shard is split by the block number) is removed from the database. Any
+/// indices that are above the block number are filtered out. The boundary shard is returned for
+/// reinsertion (if it's not empty).
+fn unwind_history_shards<'a, S, T, C>(
+    cursor: &mut C,
+    start_key: T::Key,
     block_number: BlockNumber,
-) -> std::result::Result<Vec<usize>, TransactionError> {
-    let mut item = cursor.seek_exact(ShardedKey::new(address, u64::MAX))?;
-
+    mut shard_belongs_to_key: impl FnMut(&T::Key) -> bool,
+) -> Result<Vec<usize>>
+where
+    T: Table<Value = BlockNumberList>,
+    T::Key: AsRef<ShardedKey<S>>,
+    C: DbCursorRO<'a, T> + DbCursorRW<'a, T>,
+{
+    let mut item = cursor.seek_exact(start_key)?;
     while let Some((sharded_key, list)) = item {
-        // there is no more shard for address
-        if sharded_key.key != address {
+        // If the shard does not belong to the key, break.
+        if !shard_belongs_to_key(&sharded_key) {
             break
         }
         cursor.delete_current()?;
-        // check first item and if it is more and eq than `block_number` delete current
-        // item.
-        let first = list.iter(0).next().expect("List can't empty");
+
+        // Check the first item.
+        // If it is greater or eq to the block number, delete it.
+        let first = list.iter(0).next().expect("List can't be empty");
         if first >= block_number as usize {
             item = cursor.prev()?;
             continue
-        } else if block_number <= sharded_key.highest_block_number {
-            // if first element is in scope whole list would be removed.
-            // so at least this first element is present.
-            return Ok(list.iter(0).take_while(|i| *i < block_number as usize).collect::<Vec<_>>())
-        } else {
-            let new_list = list.iter(0).collect::<Vec<_>>();
-            return Ok(new_list)
-        }
-    }
-    Ok(Vec::new())
-}
-
-/// Unwind all history shards. For boundary shard, remove it from database and
-/// return last part of shard with still valid items. If all full shard were removed, return list
-/// would be empty but this does not mean that there is none shard left but that there is no
-/// split shards.
-fn unwind_storage_history_shards<'a, TX: reth_db::transaction::DbTxMutGAT<'a>>(
-    cursor: &mut <TX as DbTxMutGAT<'a>>::CursorMut<tables::StorageHistory>,
-    address: Address,
-    storage_key: H256,
-    block_number: BlockNumber,
-) -> std::result::Result<Vec<usize>, TransactionError> {
-    let mut item = cursor.seek_exact(StorageShardedKey::new(address, storage_key, u64::MAX))?;
-
-    while let Some((storage_sharded_key, list)) = item {
-        // there is no more shard for address
-        if storage_sharded_key.address != address ||
-            storage_sharded_key.sharded_key.key != storage_key
-        {
-            // there is no more shard for address and storage_key.
-            break
-        }
-        cursor.delete_current()?;
-        // check first item and if it is more and eq than `block_number` delete current
-        // item.
-        let first = list.iter(0).next().expect("List can't empty");
-        if first >= block_number as usize {
-            item = cursor.prev()?;
-            continue
-        } else if block_number <= storage_sharded_key.sharded_key.highest_block_number {
-            // if first element is in scope whole list would be removed.
-            // so at least this first element is present.
+        } else if block_number <= sharded_key.as_ref().highest_block_number {
+            // Filter out all elements greater than block number.
             return Ok(list.iter(0).take_while(|i| *i < block_number as usize).collect::<Vec<_>>())
         } else {
             return Ok(list.iter(0).collect::<Vec<_>>())
         }
     }
+
     Ok(Vec::new())
 }
 
@@ -205,127 +179,6 @@ impl<'this, TX: DbTx<'this>> DatabaseProvider<'this, TX> {
             .walk(Some(T::Key::default()))?
             .collect::<std::result::Result<Vec<_>, DatabaseError>>()
     }
-
-    // TODO(joshie) TEMPORARY should be moved to trait providers
-
-    /// Iterate over account changesets and return all account address that were changed.
-    pub fn get_addresses_and_keys_of_changed_storages(
-        &self,
-        range: RangeInclusive<BlockNumber>,
-    ) -> std::result::Result<BTreeMap<Address, BTreeSet<H256>>, TransactionError> {
-        self.tx
-            .cursor_read::<tables::StorageChangeSet>()?
-            .walk_range(BlockNumberAddress::range(range))?
-            // fold all storages and save its old state so we can remove it from HashedStorage
-            // it is needed as it is dup table.
-            .try_fold(BTreeMap::new(), |mut accounts: BTreeMap<Address, BTreeSet<H256>>, entry| {
-                let (BlockNumberAddress((_, address)), storage_entry) = entry?;
-                accounts.entry(address).or_default().insert(storage_entry.key);
-                Ok(accounts)
-            })
-    }
-
-    /// Get plainstate storages
-    #[allow(clippy::type_complexity)]
-    pub fn get_plainstate_storages(
-        &self,
-        iter: impl IntoIterator<Item = (Address, impl IntoIterator<Item = H256>)>,
-    ) -> std::result::Result<Vec<(Address, Vec<(H256, U256)>)>, TransactionError> {
-        let mut plain_storage = self.tx.cursor_dup_read::<tables::PlainStorageState>()?;
-
-        iter.into_iter()
-            .map(|(address, storage)| {
-                storage
-                    .into_iter()
-                    .map(|key| -> std::result::Result<_, TransactionError> {
-                        let ret = plain_storage
-                            .seek_by_key_subkey(address, key)?
-                            .filter(|v| v.key == key)
-                            .unwrap_or_default();
-                        Ok((key, ret.value))
-                    })
-                    .collect::<std::result::Result<Vec<(_, _)>, _>>()
-                    .map(|storage| (address, storage))
-            })
-            .collect::<std::result::Result<Vec<(_, _)>, _>>()
-    }
-
-    /// Get all block numbers where account got changed.
-    ///
-    /// NOTE: Get inclusive range of blocks.
-    pub fn get_storage_block_numbers_from_changesets(
-        &self,
-        range: RangeInclusive<BlockNumber>,
-    ) -> std::result::Result<BTreeMap<(Address, H256), Vec<u64>>, TransactionError> {
-        let mut changeset_cursor = self.tx.cursor_read::<tables::StorageChangeSet>()?;
-
-        let storage_changeset_lists =
-            changeset_cursor.walk_range(BlockNumberAddress::range(range))?.try_fold(
-                BTreeMap::new(),
-                |mut storages: BTreeMap<(Address, H256), Vec<u64>>,
-                 entry|
-                 -> std::result::Result<_, TransactionError> {
-                    let (index, storage) = entry?;
-                    storages
-                        .entry((index.address(), storage.key))
-                        .or_default()
-                        .push(index.block_number());
-                    Ok(storages)
-                },
-            )?;
-
-        Ok(storage_changeset_lists)
-    }
-
-    /// Get all block numbers where account got changed.
-    ///
-    /// NOTE: Get inclusive range of blocks.
-    pub fn get_account_block_numbers_from_changesets(
-        &self,
-        range: RangeInclusive<BlockNumber>,
-    ) -> std::result::Result<BTreeMap<Address, Vec<u64>>, TransactionError> {
-        let mut changeset_cursor = self.tx.cursor_read::<tables::AccountChangeSet>()?;
-
-        let account_transtions = changeset_cursor.walk_range(range)?.try_fold(
-            BTreeMap::new(),
-            |mut accounts: BTreeMap<Address, Vec<u64>>,
-             entry|
-             -> std::result::Result<_, TransactionError> {
-                let (index, account) = entry?;
-                accounts.entry(account.address).or_default().push(index);
-                Ok(accounts)
-            },
-        )?;
-
-        Ok(account_transtions)
-    }
-
-    /// Iterate over account changesets and return all account address that were changed.
-    pub fn get_addresses_of_changed_accounts(
-        &self,
-        range: RangeInclusive<BlockNumber>,
-    ) -> std::result::Result<BTreeSet<Address>, TransactionError> {
-        self.tx.cursor_read::<tables::AccountChangeSet>()?.walk_range(range)?.try_fold(
-            BTreeSet::new(),
-            |mut accounts: BTreeSet<Address>, entry| {
-                let (_, account_before) = entry?;
-                accounts.insert(account_before.address);
-                Ok(accounts)
-            },
-        )
-    }
-
-    /// Get plainstate account from iterator
-    pub fn get_plainstate_accounts(
-        &self,
-        iter: impl IntoIterator<Item = Address>,
-    ) -> std::result::Result<Vec<(Address, Option<Account>)>, TransactionError> {
-        let mut plain_accounts = self.tx.cursor_read::<tables::PlainAccountState>()?;
-        Ok(iter
-            .into_iter()
-            .map(|address| plain_accounts.seek_exact(address).map(|a| (address, a.map(|(_, v)| v))))
-            .collect::<std::result::Result<Vec<_>, _>>()?)
-    }
 }
 
 impl<'this, TX: DbTxMut<'this> + DbTx<'this>> DatabaseProvider<'this, TX> {
@@ -336,212 +189,11 @@ impl<'this, TX: DbTxMut<'this> + DbTx<'this>> DatabaseProvider<'this, TX> {
 
     // TODO(joshie) TEMPORARY should be moved to trait providers
 
-    /// Get range of blocks and its execution result
-    pub fn get_block_and_execution_range(
-        &self,
-        chain_spec: &ChainSpec,
-        range: RangeInclusive<BlockNumber>,
-    ) -> std::result::Result<Chain, TransactionError> {
-        self.get_take_block_and_execution_range::<false>(chain_spec, range)
-    }
-
-    /// Take range of blocks and its execution result
-    pub fn take_block_and_execution_range(
-        &self,
-        chain_spec: &ChainSpec,
-        range: RangeInclusive<BlockNumber>,
-    ) -> std::result::Result<Chain, TransactionError> {
-        self.get_take_block_and_execution_range::<true>(chain_spec, range)
-    }
-
-    /// Unwind and clear account hashing
-    pub fn unwind_account_hashing(
-        &self,
-        range: RangeInclusive<BlockNumber>,
-    ) -> std::result::Result<(), TransactionError> {
-        let mut hashed_accounts = self.tx.cursor_write::<tables::HashedAccount>()?;
-
-        // Aggregate all block changesets and make a list of accounts that have been changed.
-        self.tx
-            .cursor_read::<tables::AccountChangeSet>()?
-            .walk_range(range)?
-            .collect::<std::result::Result<Vec<_>, _>>()?
-            .into_iter()
-            .rev()
-            // fold all account to get the old balance/nonces and account that needs to be removed
-            .fold(
-                BTreeMap::new(),
-                |mut accounts: BTreeMap<Address, Option<Account>>, (_, account_before)| {
-                    accounts.insert(account_before.address, account_before.info);
-                    accounts
-                },
-            )
-            .into_iter()
-            // hash addresses and collect it inside sorted BTreeMap.
-            // We are doing keccak only once per address.
-            .map(|(address, account)| (keccak256(address), account))
-            .collect::<BTreeMap<_, _>>()
-            .into_iter()
-            // Apply values to HashedState (if Account is None remove it);
-            .try_for_each(
-                |(hashed_address, account)| -> std::result::Result<(), TransactionError> {
-                    if let Some(account) = account {
-                        hashed_accounts.upsert(hashed_address, account)?;
-                    } else if hashed_accounts.seek_exact(hashed_address)?.is_some() {
-                        hashed_accounts.delete_current()?;
-                    }
-                    Ok(())
-                },
-            )?;
-
-        Ok(())
-    }
-
-    /// Unwind and clear storage hashing
-    pub fn unwind_storage_hashing(
-        &self,
-        range: Range<BlockNumberAddress>,
-    ) -> std::result::Result<(), TransactionError> {
-        let mut hashed_storage = self.tx.cursor_dup_write::<tables::HashedStorage>()?;
-
-        // Aggregate all block changesets and make list of accounts that have been changed.
-        self.tx
-            .cursor_read::<tables::StorageChangeSet>()?
-            .walk_range(range)?
-            .collect::<std::result::Result<Vec<_>, _>>()?
-            .into_iter()
-            .rev()
-            // fold all account to get the old balance/nonces and account that needs to be removed
-            .fold(
-                BTreeMap::new(),
-                |mut accounts: BTreeMap<(Address, H256), U256>,
-                 (BlockNumberAddress((_, address)), storage_entry)| {
-                    accounts.insert((address, storage_entry.key), storage_entry.value);
-                    accounts
-                },
-            )
-            .into_iter()
-            // hash addresses and collect it inside sorted BTreeMap.
-            // We are doing keccak only once per address.
-            .map(|((address, key), value)| ((keccak256(address), keccak256(key)), value))
-            .collect::<BTreeMap<_, _>>()
-            .into_iter()
-            // Apply values to HashedStorage (if Value is zero just remove it);
-            .try_for_each(
-                |((hashed_address, key), value)| -> std::result::Result<(), TransactionError> {
-                    if hashed_storage
-                        .seek_by_key_subkey(hashed_address, key)?
-                        .filter(|entry| entry.key == key)
-                        .is_some()
-                    {
-                        hashed_storage.delete_current()?;
-                    }
-
-                    if value != U256::ZERO {
-                        hashed_storage.upsert(hashed_address, StorageEntry { key, value })?;
-                    }
-                    Ok(())
-                },
-            )?;
-
-        Ok(())
-    }
-
-    /// Unwind and clear account history indices.
-    ///
-    /// Returns number of changesets walked.
-    pub fn unwind_account_history_indices(
-        &self,
-        range: RangeInclusive<BlockNumber>,
-    ) -> std::result::Result<usize, TransactionError> {
-        let account_changeset = self
-            .tx
-            .cursor_read::<tables::AccountChangeSet>()?
-            .walk_range(range)?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        let changesets = account_changeset.len();
-
-        let last_indices = account_changeset
-            .into_iter()
-            // reverse so we can get lowest block number where we need to unwind account.
-            .rev()
-            // fold all account and get last block number
-            .fold(BTreeMap::new(), |mut accounts: BTreeMap<Address, u64>, (index, account)| {
-                // we just need address and lowest block number.
-                accounts.insert(account.address, index);
-                accounts
-            });
-        // try to unwind the index
-        let mut cursor = self.tx.cursor_write::<tables::AccountHistory>()?;
-        for (address, rem_index) in last_indices {
-            let shard_part = unwind_account_history_shards::<TX>(&mut cursor, address, rem_index)?;
-
-            // check last shard_part, if present, items needs to be reinserted.
-            if !shard_part.is_empty() {
-                // there are items in list
-                self.tx.put::<tables::AccountHistory>(
-                    ShardedKey::new(address, u64::MAX),
-                    BlockNumberList::new(shard_part)
-                        .expect("There is at least one element in list and it is sorted."),
-                )?;
-            }
-        }
-
-        Ok(changesets)
-    }
-
-    /// Unwind and clear storage history indices.
-    ///
-    /// Returns number of changesets walked.
-    pub fn unwind_storage_history_indices(
-        &self,
-        range: Range<BlockNumberAddress>,
-    ) -> std::result::Result<usize, TransactionError> {
-        let storage_changesets = self
-            .tx
-            .cursor_read::<tables::StorageChangeSet>()?
-            .walk_range(range)?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        let changesets = storage_changesets.len();
-
-        let last_indices = storage_changesets
-            .into_iter()
-            // reverse so we can get lowest block number where we need to unwind account.
-            .rev()
-            // fold all storages and get last block number
-            .fold(
-                BTreeMap::new(),
-                |mut accounts: BTreeMap<(Address, H256), u64>, (index, storage)| {
-                    // we just need address and lowest block number.
-                    accounts.insert((index.address(), storage.key), index.block_number());
-                    accounts
-                },
-            );
-
-        let mut cursor = self.tx.cursor_write::<tables::StorageHistory>()?;
-        for ((address, storage_key), rem_index) in last_indices {
-            let shard_part =
-                unwind_storage_history_shards::<TX>(&mut cursor, address, storage_key, rem_index)?;
-
-            // check last shard_part, if present, items needs to be reinserted.
-            if !shard_part.is_empty() {
-                // there are items in list
-                self.tx.put::<tables::StorageHistory>(
-                    StorageShardedKey::new(address, storage_key, u64::MAX),
-                    BlockNumberList::new(shard_part)
-                        .expect("There is at least one element in list and it is sorted."),
-                )?;
-            }
-        }
-
-        Ok(changesets)
-    }
-
     /// Unwind or peek at last N blocks of state
     pub fn unwind_or_peek_state<const UNWIND: bool>(
         &self,
         range: RangeInclusive<BlockNumber>,
-    ) -> std::result::Result<BundleState, TransactionError> {
+    ) -> Result<BundleState> {
         if range.is_empty() {
             return Ok(BundleState::default())
         }
@@ -680,69 +332,6 @@ impl<'this, TX: DbTxMut<'this> + DbTx<'this>> DatabaseProvider<'this, TX> {
         Ok(BundleState::new_init(state, receipts, start_block_number))
     }
 
-    /// Return range of blocks and its execution result
-    pub fn get_take_block_and_execution_range<const TAKE: bool>(
-        &self,
-        chain_spec: &ChainSpec,
-        range: RangeInclusive<BlockNumber>,
-    ) -> std::result::Result<Chain, TransactionError> {
-        if TAKE {
-            let storage_range = BlockNumberAddress::range(range.clone());
-
-            self.unwind_account_hashing(range.clone())?;
-            self.unwind_account_history_indices(range.clone())?;
-            self.unwind_storage_hashing(storage_range.clone())?;
-            self.unwind_storage_history_indices(storage_range)?;
-
-            // merkle tree
-            let (new_state_root, trie_updates) =
-                StateRoot::incremental_root_with_updates(&self.tx, range.clone())?;
-
-            let parent_number = range.start().saturating_sub(1);
-            let parent_state_root = self
-                .header_by_number(parent_number)?
-                .ok_or_else(|| ProviderError::HeaderNotFound(parent_number.into()))?
-                .state_root;
-
-            // state root should be always correct as we are reverting state.
-            // but for sake of double verification we will check it again.
-            if new_state_root != parent_state_root {
-                let parent_hash = self
-                    .block_hash(parent_number)?
-                    .ok_or_else(|| ProviderError::HeaderNotFound(parent_number.into()))?;
-                return Err(TransactionError::UnwindStateRootMismatch {
-                    got: new_state_root,
-                    expected: parent_state_root,
-                    block_number: parent_number,
-                    block_hash: parent_hash,
-                })
-            }
-            trie_updates.flush(&self.tx)?;
-        }
-        // get blocks
-        let blocks = self.get_take_block_range::<TAKE>(chain_spec, range.clone())?;
-        let unwind_to = blocks.first().map(|b| b.number.saturating_sub(1));
-        // get execution res
-        let execution_state = self.unwind_or_peek_state::<TAKE>(range.clone())?;
-
-        // remove block bodies it is needed for both get block range and get block execution results
-        // that is why it is deleted afterwards.
-        if TAKE {
-            // rm block bodies
-            self.get_or_take::<tables::BlockBodyIndices, TAKE>(range)?;
-
-            // Update pipeline progress
-            if let Some(fork_number) = unwind_to {
-                self.update_pipeline_stages(fork_number, true)?;
-            }
-        }
-
-        // return them
-        // TODO
-        //Ok(blocks_with_exec_result)
-        Ok(Chain::new(blocks, execution_state))
-    }
-
     /// Return list of entries from table
     ///
     /// If TAKE is true, opened cursor would be write and it would delete all values from db.
@@ -772,8 +361,7 @@ impl<'this, TX: DbTxMut<'this> + DbTx<'this>> DatabaseProvider<'this, TX> {
     fn get_take_block_transaction_range<const TAKE: bool>(
         &self,
         range: impl RangeBounds<BlockNumber> + Clone,
-    ) -> std::result::Result<Vec<(BlockNumber, Vec<TransactionSignedEcRecovered>)>, TransactionError>
-    {
+    ) -> Result<Vec<(BlockNumber, Vec<TransactionSignedEcRecovered>)>> {
         // Raad range of block bodies to get all transactions id's of this range.
         let block_bodies = self.get_or_take::<tables::BlockBodyIndices, false>(range)?;
 
@@ -852,7 +440,7 @@ impl<'this, TX: DbTxMut<'this> + DbTx<'this>> DatabaseProvider<'this, TX> {
         &self,
         chain_spec: &ChainSpec,
         range: impl RangeBounds<BlockNumber> + Clone,
-    ) -> std::result::Result<Vec<SealedBlockWithSenders>, TransactionError> {
+    ) -> Result<Vec<SealedBlockWithSenders>> {
         // For block we need Headers, Bodies, Uncles, withdrawals, Transactions, Signers
 
         let block_headers = self.get_or_take::<tables::Headers, TAKE>(range.clone())?;
@@ -934,110 +522,8 @@ impl<'this, TX: DbTxMut<'this> + DbTx<'this>> DatabaseProvider<'this, TX> {
         Ok(blocks)
     }
 
-    /// Update all pipeline sync stage progress.
-    pub fn update_pipeline_stages(
-        &self,
-        block_number: BlockNumber,
-        drop_stage_checkpoint: bool,
-    ) -> std::result::Result<(), TransactionError> {
-        // iterate over all existing stages in the table and update its progress.
-        let mut cursor = self.tx.cursor_write::<tables::SyncStage>()?;
-        while let Some((stage_name, checkpoint)) = cursor.next()? {
-            cursor.upsert(
-                stage_name,
-                StageCheckpoint {
-                    block_number,
-                    ..if drop_stage_checkpoint { Default::default() } else { checkpoint }
-                },
-            )?
-        }
-
-        Ok(())
-    }
-
-    /// Insert storage change index to database. Used inside StorageHistoryIndex stage
-    pub fn insert_storage_history_index(
-        &self,
-        storage_transitions: BTreeMap<(Address, H256), Vec<u64>>,
-    ) -> std::result::Result<(), TransactionError> {
-        for ((address, storage_key), mut indices) in storage_transitions {
-            let mut last_shard = self.take_last_storage_shard(address, storage_key)?;
-            last_shard.append(&mut indices);
-
-            // chunk indices and insert them in shards of N size.
-            let mut chunks = last_shard
-                .iter()
-                .chunks(storage_sharded_key::NUM_OF_INDICES_IN_SHARD)
-                .into_iter()
-                .map(|chunks| chunks.map(|i| *i as usize).collect::<Vec<usize>>())
-                .collect::<Vec<_>>();
-            let last_chunk = chunks.pop();
-
-            // chunk indices and insert them in shards of N size.
-            chunks.into_iter().try_for_each(|list| {
-                self.tx.put::<tables::StorageHistory>(
-                    StorageShardedKey::new(
-                        address,
-                        storage_key,
-                        *list.last().expect("Chuck does not return empty list") as BlockNumber,
-                    ),
-                    BlockNumberList::new(list).expect("Indices are presorted and not empty"),
-                )
-            })?;
-            // Insert last list with u64::MAX
-            if let Some(last_list) = last_chunk {
-                self.tx.put::<tables::StorageHistory>(
-                    StorageShardedKey::new(address, storage_key, u64::MAX),
-                    BlockNumberList::new(last_list).expect("Indices are presorted and not empty"),
-                )?;
-            }
-        }
-        Ok(())
-    }
-
-    /// Insert account change index to database. Used inside AccountHistoryIndex stage
-    pub fn insert_account_history_index(
-        &self,
-        account_transitions: BTreeMap<Address, Vec<u64>>,
-    ) -> std::result::Result<(), TransactionError> {
-        // insert indexes to AccountHistory.
-        for (address, mut indices) in account_transitions {
-            let mut last_shard = self.take_last_account_shard(address)?;
-            last_shard.append(&mut indices);
-            // chunk indices and insert them in shards of N size.
-            let mut chunks = last_shard
-                .iter()
-                .chunks(sharded_key::NUM_OF_INDICES_IN_SHARD)
-                .into_iter()
-                .map(|chunks| chunks.map(|i| *i as usize).collect::<Vec<usize>>())
-                .collect::<Vec<_>>();
-            let last_chunk = chunks.pop();
-
-            chunks.into_iter().try_for_each(|list| {
-                self.tx.put::<tables::AccountHistory>(
-                    ShardedKey::new(
-                        address,
-                        *list.last().expect("Chuck does not return empty list") as BlockNumber,
-                    ),
-                    BlockNumberList::new(list).expect("Indices are presorted and not empty"),
-                )
-            })?;
-            // Insert last list with u64::MAX
-            if let Some(last_list) = last_chunk {
-                self.tx.put::<tables::AccountHistory>(
-                    ShardedKey::new(address, u64::MAX),
-                    BlockNumberList::new(last_list).expect("Indices are presorted and not empty"),
-                )?
-            }
-        }
-        Ok(())
-    }
-
     /// Query the block body by number.
-    pub fn block_body_indices(
-        &self,
-        number: BlockNumber,
-    ) -> std::result::Result<StoredBlockBodyIndices, TransactionError> {
+    pub fn block_body_indices(&self, number: BlockNumber) -> Result<StoredBlockBodyIndices> {
         let body = self
             .tx
             .get::<tables::BlockBodyIndices>(number)?
@@ -1102,228 +588,74 @@ impl<'this, TX: DbTxMut<'this> + DbTx<'this>> DatabaseProvider<'this, TX> {
         Ok(())
     }
 
-    /// Load last shard and check if it is full and remove if it is not. If list is empty, last
-    /// shard was full or there is no shards at all.
-    fn take_last_account_shard(
-        &self,
-        address: Address,
-    ) -> std::result::Result<Vec<u64>, TransactionError> {
-        let mut cursor = self.tx.cursor_read::<tables::AccountHistory>()?;
-        let last = cursor.seek_exact(ShardedKey::new(address, u64::MAX))?;
-        if let Some((shard_key, list)) = last {
+    /// Load shard and remove it. If list is empty, last shard was full or
+    /// there are no shards at all.
+    fn take_shard<T>(&self, key: T::Key) -> Result<Vec<u64>>
+    where
+        T: Table<Value = BlockNumberList>,
+    {
+        let mut cursor = self.tx.cursor_read::<T>()?;
+        let shard = cursor.seek_exact(key)?;
+        if let Some((shard_key, list)) = shard {
             // delete old shard so new one can be inserted.
-            self.tx.delete::<tables::AccountHistory>(shard_key, None)?;
+            self.tx.delete::<T>(shard_key, None)?;
             let list = list.iter(0).map(|i| i as u64).collect::<Vec<_>>();
             return Ok(list)
         }
         Ok(Vec::new())
     }
 
-    /// Load last shard and check if it is full and remove if it is not. If list is empty, last
-    /// shard was full or there is no shards at all.
-    pub fn take_last_storage_shard(
-        &self,
-        address: Address,
-        storage_key: H256,
-    ) -> std::result::Result<Vec<u64>, TransactionError> {
-        let mut cursor = self.tx.cursor_read::<tables::StorageHistory>()?;
-        let last = cursor.seek_exact(StorageShardedKey::new(address, storage_key, u64::MAX))?;
-        if let Some((storage_shard_key, list)) = last {
-            // delete old shard so new one can be inserted.
-            self.tx.delete::<tables::StorageHistory>(storage_shard_key, None)?;
-            let list = list.iter(0).map(|i| i as u64).collect::<Vec<_>>();
-            return Ok(list)
-        }
-        Ok(Vec::new())
-    }
-    /// iterate over storages and insert them to hashing table
-    pub fn insert_storage_for_hashing(
-        &self,
-        storages: impl IntoIterator<Item = (Address, impl IntoIterator<Item = (H256, U256)>)>,
-    ) -> std::result::Result<(), TransactionError> {
-        // hash values
-        let hashed = storages.into_iter().fold(BTreeMap::new(), |mut map, (address, storage)| {
-            let storage = storage.into_iter().fold(BTreeMap::new(), |mut map, (key, value)| {
-                map.insert(keccak256(key), value);
-                map
-            });
-            map.insert(keccak256(address), storage);
-            map
-        });
-
-        let mut hashed_storage = self.tx.cursor_dup_write::<tables::HashedStorage>()?;
-        // Hash the address and key and apply them to HashedStorage (if Storage is None
-        // just remove it);
-        hashed.into_iter().try_for_each(|(hashed_address, storage)| {
-            storage.into_iter().try_for_each(
-                |(key, value)| -> std::result::Result<(), TransactionError> {
-                    if hashed_storage
-                        .seek_by_key_subkey(hashed_address, key)?
-                        .filter(|entry| entry.key == key)
-                        .is_some()
-                    {
-                        hashed_storage.delete_current()?;
-                    }
-
-                    if value != U256::ZERO {
-                        hashed_storage.upsert(hashed_address, StorageEntry { key, value })?;
-                    }
-                    Ok(())
-                },
-            )
-        })?;
-        Ok(())
-    }
-
-    /// iterate over accounts and insert them to hashing table
-    pub fn insert_account_for_hashing(
-        &self,
-        accounts: impl IntoIterator<Item = (Address, Option<Account>)>,
-    ) -> std::result::Result<(), TransactionError> {
-        let mut hashed_accounts = self.tx.cursor_write::<tables::HashedAccount>()?;
-
-        let hashes_accounts = accounts.into_iter().fold(
-            BTreeMap::new(),
-            |mut map: BTreeMap<H256, Option<Account>>, (address, account)| {
-                map.insert(keccak256(address), account);
-                map
-            },
-        );
-
-        hashes_accounts.into_iter().try_for_each(
-            |(hashed_address, account)| -> std::result::Result<(), TransactionError> {
-                if let Some(account) = account {
-                    hashed_accounts.upsert(hashed_address, account)?
-                } else if hashed_accounts.seek_exact(hashed_address)?.is_some() {
-                    hashed_accounts.delete_current()?;
-                }
-                Ok(())
-            },
-        )?;
-        Ok(())
-    }
-
-    /// Append blocks and insert its post state.
-    /// This will insert block data to all related tables and will update pipeline progress.
-    pub fn append_blocks_with_bundle_state(
-        &mut self,
-        blocks: Vec<SealedBlockWithSenders>,
-        state: BundleState,
-    ) -> std::result::Result<(), TransactionError> {
-        if blocks.is_empty() {
-            return Ok(())
-        }
-        let new_tip = blocks.last().unwrap();
-        let new_tip_number = new_tip.number;
-
-        let first_number = blocks.first().unwrap().number;
-
-        let last = blocks.last().unwrap();
-        let last_block_number = last.number;
-        let last_block_hash = last.hash();
-        let expected_state_root = last.state_root;
-
-        // Insert the blocks
-        for block in blocks {
-            let (block, senders) = block.into_components();
-            insert_canonical_block(self.tx_mut(), block, Some(senders))?;
-        }
-
-        // Write state and changesets to the database.
-        // Must be written after blocks because of the receipt lookup.
-        state.write_to_db(self.tx_mut(), true)?;
-
-        self.insert_hashes(first_number..=last_block_number, last_block_hash, expected_state_root)?;
-
-        self.calculate_history_indices(first_number..=last_block_number)?;
-
-        // Update pipeline progress
-        self.update_pipeline_stages(new_tip_number, false)?;
-
-        Ok(())
-    }
-
-    /// Insert full block and make it canonical.
-    pub fn insert_block(
-        &mut self,
-        block: SealedBlock,
-        senders: Option<Vec<Address>>,
-    ) -> std::result::Result<(), TransactionError> {
-        insert_canonical_block(self.tx_mut(), block, senders)?;
-        Ok(())
-    }
-
-    /// Read account/storage changesets and update account/storage history indices.
-    pub fn calculate_history_indices(
-        &mut self,
-        range: RangeInclusive<BlockNumber>,
-    ) -> std::result::Result<(), TransactionError> {
-        // account history stage
-        {
-            let indices = self.get_account_block_numbers_from_changesets(range.clone())?;
-            self.insert_account_history_index(indices)?;
-        }
-
-        // storage history stage
-        {
-            let indices = self.get_storage_block_numbers_from_changesets(range)?;
-            self.insert_storage_history_index(indices)?;
-        }
-
-        Ok(())
-    }
-
-    /// Calculate the hashes of all changed accounts and storages, and finally calculate the state
-    /// root.
+    /// Insert history index to the database.
     ///
-    /// The hashes are calculated from `fork_block_number + 1` to `current_block_number`.
+    /// For each updated partial key, this function removes the last shard from
+    /// the database (if any), appends the new indices to it, chunks the resulting integer list and
+    /// inserts the new shards back into the database.
     ///
-    /// The resulting state root is compared with `expected_state_root`.
-    pub fn insert_hashes(
-        &mut self,
-        range: RangeInclusive<BlockNumber>,
-        end_block_hash: H256,
-        expected_state_root: H256,
-    ) -> std::result::Result<(), TransactionError> {
-        // storage hashing stage
-        {
-            let lists = self.get_addresses_and_keys_of_changed_storages(range.clone())?;
-            let storages = self.get_plainstate_storages(lists.into_iter())?;
-            self.insert_storage_for_hashing(storages.into_iter())?;
-        }
+    /// This function is used by history indexing stages.
+    fn append_history_index<P, T>(
+        &self,
+        index_updates: BTreeMap<P, Vec<u64>>,
+        mut sharded_key_factory: impl FnMut(P, BlockNumber) -> T::Key,
+    ) -> Result<()>
+    where
+        P: Copy,
+        T: Table<Value = BlockNumberList>,
+    {
+        for (partial_key, indices) in index_updates {
+            let last_shard = self.take_shard::<T>(sharded_key_factory(partial_key, u64::MAX))?;
+            // chunk indices and insert them in shards of N size.
+            let indices = last_shard.iter().chain(indices.iter());
+            let chunks = indices
+                .chunks(sharded_key::NUM_OF_INDICES_IN_SHARD)
+                .into_iter()
+                .map(|chunks| chunks.map(|i| *i as usize).collect::<Vec<usize>>())
+                .collect::<Vec<_>>();
 
-        // account hashing stage
-        {
-            let lists = self.get_addresses_of_changed_accounts(range.clone())?;
-            let accounts = self.get_plainstate_accounts(lists.into_iter())?;
-            self.insert_account_for_hashing(accounts.into_iter())?;
-        }
-
-        // merkle tree
-        {
-            let (state_root, trie_updates) =
-                StateRoot::incremental_root_with_updates(&self.tx, range.clone())?;
-            if state_root != expected_state_root {
-                return Err(TransactionError::StateRootMismatch {
-                    got: state_root,
-                    expected: expected_state_root,
-                    block_number: *range.end(),
-                    block_hash: end_block_hash,
-                })
+            let mut chunks = chunks.into_iter().peekable();
+            while let Some(list) = chunks.next() {
+                let highest_block_number = if chunks.peek().is_some() {
+                    *list.last().expect("`chunks` does not return empty list") as u64
+                } else {
+                    // Insert last list with u64::MAX
+                    u64::MAX
+                };
+                self.tx.put::<T>(
+                    sharded_key_factory(partial_key, highest_block_number),
+                    BlockNumberList::new_pre_sorted(list),
+                )?;
             }
-            trie_updates.flush(&self.tx)?;
         }
         Ok(())
     }
 }
 
-impl<'this, TX: DbTx<'this>> AccountProvider for DatabaseProvider<'this, TX> {
+impl<'this, TX: DbTx<'this>> AccountReader for DatabaseProvider<'this, TX> {
     fn basic_account(&self, address: Address) -> Result<Option<Account>> {
         Ok(self.tx.get::<tables::PlainAccountState>(address)?)
     }
 }
 
-impl<'this, TX: DbTx<'this>> AccountExtProvider for DatabaseProvider<'this, TX> {
+impl<'this, TX: DbTx<'this>> AccountExtReader for DatabaseProvider<'this, TX> {
     fn changed_accounts_with_range(
         &self,
         range: impl RangeBounds<BlockNumber>,
@@ -1346,6 +678,24 @@ impl<'this, TX: DbTx<'this>> AccountExtProvider for DatabaseProvider<'this, TX> 
             .into_iter()
             .map(|address| plain_accounts.seek_exact(address).map(|a| (address, a.map(|(_, v)| v))))
             .collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    fn changed_accounts_and_blocks_with_range(
+        &self,
+        range: RangeInclusive<BlockNumber>,
+    ) -> Result<BTreeMap<Address, Vec<u64>>> {
+        let mut changeset_cursor = self.tx.cursor_read::<tables::AccountChangeSet>()?;
+
+        let account_transitions = changeset_cursor.walk_range(range)?.try_fold(
+            BTreeMap::new(),
+            |mut accounts: BTreeMap<Address, Vec<u64>>, entry| -> Result<_> {
+                let (index, account) = entry?;
+                accounts.entry(account.address).or_default().push(index);
+                Ok(accounts)
+            },
+        )?;
+
+        Ok(account_transitions)
     }
 }
 
@@ -1415,7 +765,7 @@ impl<'this, TX: DbTx<'this>> HeaderProvider for DatabaseProvider<'this, TX> {
     }
 }
 
-impl<'this, TX: DbTx<'this>> BlockHashProvider for DatabaseProvider<'this, TX> {
+impl<'this, TX: DbTx<'this>> BlockHashReader for DatabaseProvider<'this, TX> {
     fn block_hash(&self, number: u64) -> Result<Option<H256>> {
         Ok(self.tx.get::<tables::CanonicalHeaders>(number)?)
     }
@@ -1430,7 +780,7 @@ impl<'this, TX: DbTx<'this>> BlockHashProvider for DatabaseProvider<'this, TX> {
     }
 }
 
-impl<'this, TX: DbTx<'this>> BlockNumProvider for DatabaseProvider<'this, TX> {
+impl<'this, TX: DbTx<'this>> BlockNumReader for DatabaseProvider<'this, TX> {
     fn chain_info(&self) -> Result<ChainInfo> {
         let best_number = self.best_block_number()?;
         let best_hash = self.block_hash(best_number)?.unwrap_or_default();
@@ -1453,7 +803,7 @@ impl<'this, TX: DbTx<'this>> BlockNumProvider for DatabaseProvider<'this, TX> {
     }
 }
 
-impl<'this, TX: DbTx<'this>> BlockProvider for DatabaseProvider<'this, TX> {
+impl<'this, TX: DbTx<'this>> BlockReader for DatabaseProvider<'this, TX> {
     fn find_block_by_hash(&self, hash: H256, source: BlockSource) -> Result<Option<Block>> {
         if source.is_database() {
             self.block(hash.into())
@@ -1479,6 +829,10 @@ impl<'this, TX: DbTx<'this>> BlockProvider for DatabaseProvider<'this, TX> {
     }
 
     fn pending_block(&self) -> Result<Option<SealedBlock>> {
+        Ok(None)
+    }
+
+    fn pending_block_and_receipts(&self) -> Result<Option<(SealedBlock, Vec<Receipt>)>> {
         Ok(None)
     }
 
@@ -1824,5 +1178,583 @@ impl<'this, TX: DbTxMut<'this>> StageCheckpointWriter for DatabaseProvider<'this
     /// Save stage checkpoint.
     fn save_stage_checkpoint(&self, id: StageId, checkpoint: StageCheckpoint) -> Result<()> {
         Ok(self.tx.put::<tables::SyncStage>(id.to_string(), checkpoint)?)
+    }
+
+    fn update_pipeline_stages(
+        &self,
+        block_number: BlockNumber,
+        drop_stage_checkpoint: bool,
+    ) -> Result<()> {
+        // iterate over all existing stages in the table and update its progress.
+        let mut cursor = self.tx.cursor_write::<tables::SyncStage>()?;
+        while let Some((stage_name, checkpoint)) = cursor.next()? {
+            cursor.upsert(
+                stage_name,
+                StageCheckpoint {
+                    block_number,
+                    ..if drop_stage_checkpoint { Default::default() } else { checkpoint }
+                },
+            )?
+        }
+
+        Ok(())
+    }
+}
+
+impl<'this, TX: DbTx<'this>> StorageReader for DatabaseProvider<'this, TX> {
+    fn plainstate_storages(
+        &self,
+        addresses_with_keys: impl IntoIterator<Item = (Address, impl IntoIterator<Item = H256>)>,
+    ) -> Result<Vec<(Address, Vec<StorageEntry>)>> {
+        let mut plain_storage = self.tx.cursor_dup_read::<tables::PlainStorageState>()?;
+
+        addresses_with_keys
+            .into_iter()
+            .map(|(address, storage)| {
+                storage
+                    .into_iter()
+                    .map(|key| -> Result<_> {
+                        Ok(plain_storage
+                            .seek_by_key_subkey(address, key)?
+                            .filter(|v| v.key == key)
+                            .unwrap_or_else(|| StorageEntry { key, value: Default::default() }))
+                    })
+                    .collect::<Result<Vec<_>>>()
+                    .map(|storage| (address, storage))
+            })
+            .collect::<Result<Vec<(_, _)>>>()
+    }
+
+    fn changed_storages_with_range(
+        &self,
+        range: RangeInclusive<BlockNumber>,
+    ) -> Result<BTreeMap<Address, BTreeSet<H256>>> {
+        self.tx
+            .cursor_read::<tables::StorageChangeSet>()?
+            .walk_range(BlockNumberAddress::range(range))?
+            // fold all storages and save its old state so we can remove it from HashedStorage
+            // it is needed as it is dup table.
+            .try_fold(BTreeMap::new(), |mut accounts: BTreeMap<Address, BTreeSet<H256>>, entry| {
+                let (BlockNumberAddress((_, address)), storage_entry) = entry?;
+                accounts.entry(address).or_default().insert(storage_entry.key);
+                Ok(accounts)
+            })
+    }
+
+    fn changed_storages_and_blocks_with_range(
+        &self,
+        range: RangeInclusive<BlockNumber>,
+    ) -> Result<BTreeMap<(Address, H256), Vec<u64>>> {
+        let mut changeset_cursor = self.tx.cursor_read::<tables::StorageChangeSet>()?;
+
+        let storage_changeset_lists =
+            changeset_cursor.walk_range(BlockNumberAddress::range(range))?.try_fold(
+                BTreeMap::new(),
+                |mut storages: BTreeMap<(Address, H256), Vec<u64>>, entry| -> Result<_> {
+                    let (index, storage) = entry?;
+                    storages
+                        .entry((index.address(), storage.key))
+                        .or_default()
+                        .push(index.block_number());
+                    Ok(storages)
+                },
+            )?;
+
+        Ok(storage_changeset_lists)
+    }
+}
+
+impl<'this, TX: DbTxMut<'this> + DbTx<'this>> HashingWriter for DatabaseProvider<'this, TX> {
+    fn insert_hashes(
+        &self,
+        range: RangeInclusive<BlockNumber>,
+        end_block_hash: H256,
+        expected_state_root: H256,
+    ) -> Result<()> {
+        // storage hashing stage
+        {
+            let lists = self.changed_storages_with_range(range.clone())?;
+            let storages = self.plainstate_storages(lists.into_iter())?;
+            self.insert_storage_for_hashing(storages.into_iter())?;
+        }
+
+        // account hashing stage
+        {
+            let lists = self.changed_accounts_with_range(range.clone())?;
+            let accounts = self.basic_accounts(lists.into_iter())?;
+            self.insert_account_for_hashing(accounts.into_iter())?;
+        }
+
+        // merkle tree
+        {
+            let (state_root, trie_updates) =
+                StateRoot::incremental_root_with_updates(&self.tx, range.clone())
+                    .map_err(Into::<reth_db::DatabaseError>::into)?;
+            if state_root != expected_state_root {
+                return Err(ProviderError::StateRootMismatch {
+                    got: state_root,
+                    expected: expected_state_root,
+                    block_number: *range.end(),
+                    block_hash: end_block_hash,
+                }
+                .into())
+            }
+            trie_updates.flush(&self.tx)?;
+        }
+        Ok(())
+    }
+
+    fn unwind_storage_hashing(&self, range: Range<BlockNumberAddress>) -> Result<()> {
+        let mut hashed_storage = self.tx.cursor_dup_write::<tables::HashedStorage>()?;
+
+        // Aggregate all block changesets and make list of accounts that have been changed.
+        self.tx
+            .cursor_read::<tables::StorageChangeSet>()?
+            .walk_range(range)?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+            .into_iter()
+            .rev()
+            // fold all account to get the old balance/nonces and account that needs to be removed
+            .fold(
+                BTreeMap::new(),
+                |mut accounts: BTreeMap<(Address, H256), U256>,
+                 (BlockNumberAddress((_, address)), storage_entry)| {
+                    accounts.insert((address, storage_entry.key), storage_entry.value);
+                    accounts
+                },
+            )
+            .into_iter()
+            // hash addresses and collect it inside sorted BTreeMap.
+            // We are doing keccak only once per address.
+            .map(|((address, key), value)| ((keccak256(address), keccak256(key)), value))
+            .collect::<BTreeMap<_, _>>()
+            .into_iter()
+            // Apply values to HashedStorage (if Value is zero just remove it);
+            .try_for_each(|((hashed_address, key), value)| -> Result<()> {
+                if hashed_storage
+                    .seek_by_key_subkey(hashed_address, key)?
+                    .filter(|entry| entry.key == key)
+                    .is_some()
+                {
+                    hashed_storage.delete_current()?;
+                }
+
+                if value != U256::ZERO {
+                    hashed_storage.upsert(hashed_address, StorageEntry { key, value })?;
+                }
+                Ok(())
+            })?;
+
+        Ok(())
+    }
+
+    fn insert_storage_for_hashing(
+        &self,
+        storages: impl IntoIterator<Item = (Address, impl IntoIterator<Item = StorageEntry>)>,
+    ) -> Result<()> {
+        // hash values
+        let hashed = storages.into_iter().fold(BTreeMap::new(), |mut map, (address, storage)| {
+            let storage = storage.into_iter().fold(BTreeMap::new(), |mut map, entry| {
+                map.insert(keccak256(entry.key), entry.value);
+                map
+            });
+            map.insert(keccak256(address), storage);
+            map
+        });
+
+        let mut hashed_storage = self.tx.cursor_dup_write::<tables::HashedStorage>()?;
+        // Hash the address and key and apply them to HashedStorage (if Storage is None
+        // just remove it);
+        hashed.into_iter().try_for_each(|(hashed_address, storage)| {
+            storage.into_iter().try_for_each(|(key, value)| -> Result<()> {
+                if hashed_storage
+                    .seek_by_key_subkey(hashed_address, key)?
+                    .filter(|entry| entry.key == key)
+                    .is_some()
+                {
+                    hashed_storage.delete_current()?;
+                }
+
+                if value != U256::ZERO {
+                    hashed_storage.upsert(hashed_address, StorageEntry { key, value })?;
+                }
+                Ok(())
+            })
+        })?;
+        Ok(())
+    }
+
+    fn unwind_account_hashing(&self, range: RangeInclusive<BlockNumber>) -> Result<()> {
+        let mut hashed_accounts = self.tx.cursor_write::<tables::HashedAccount>()?;
+
+        // Aggregate all block changesets and make a list of accounts that have been changed.
+        self.tx
+            .cursor_read::<tables::AccountChangeSet>()?
+            .walk_range(range)?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+            .into_iter()
+            .rev()
+            // fold all account to get the old balance/nonces and account that needs to be removed
+            .fold(
+                BTreeMap::new(),
+                |mut accounts: BTreeMap<Address, Option<Account>>, (_, account_before)| {
+                    accounts.insert(account_before.address, account_before.info);
+                    accounts
+                },
+            )
+            .into_iter()
+            // hash addresses and collect it inside sorted BTreeMap.
+            // We are doing keccak only once per address.
+            .map(|(address, account)| (keccak256(address), account))
+            .collect::<BTreeMap<_, _>>()
+            .into_iter()
+            // Apply values to HashedState (if Account is None remove it);
+            .try_for_each(|(hashed_address, account)| -> Result<()> {
+                if let Some(account) = account {
+                    hashed_accounts.upsert(hashed_address, account)?;
+                } else if hashed_accounts.seek_exact(hashed_address)?.is_some() {
+                    hashed_accounts.delete_current()?;
+                }
+                Ok(())
+            })?;
+
+        Ok(())
+    }
+
+    fn insert_account_for_hashing(
+        &self,
+        accounts: impl IntoIterator<Item = (Address, Option<Account>)>,
+    ) -> Result<()> {
+        let mut hashed_accounts = self.tx.cursor_write::<tables::HashedAccount>()?;
+
+        let hashes_accounts = accounts.into_iter().fold(
+            BTreeMap::new(),
+            |mut map: BTreeMap<H256, Option<Account>>, (address, account)| {
+                map.insert(keccak256(address), account);
+                map
+            },
+        );
+
+        hashes_accounts.into_iter().try_for_each(|(hashed_address, account)| -> Result<()> {
+            if let Some(account) = account {
+                hashed_accounts.upsert(hashed_address, account)?
+            } else if hashed_accounts.seek_exact(hashed_address)?.is_some() {
+                hashed_accounts.delete_current()?;
+            }
+            Ok(())
+        })?;
+        Ok(())
+    }
+}
+
+impl<'this, TX: DbTxMut<'this> + DbTx<'this>> HistoryWriter for DatabaseProvider<'this, TX> {
+    fn calculate_history_indices(&self, range: RangeInclusive<BlockNumber>) -> Result<()> {
+        // account history stage
+        {
+            let indices = self.changed_accounts_and_blocks_with_range(range.clone())?;
+            self.insert_account_history_index(indices)?;
+        }
+
+        // storage history stage
+        {
+            let indices = self.changed_storages_and_blocks_with_range(range)?;
+            self.insert_storage_history_index(indices)?;
+        }
+
+        Ok(())
+    }
+
+    fn insert_storage_history_index(
+        &self,
+        storage_transitions: BTreeMap<(Address, H256), Vec<u64>>,
+    ) -> Result<()> {
+        self.append_history_index::<_, tables::StorageHistory>(
+            storage_transitions,
+            |(address, storage_key), highest_block_number| {
+                StorageShardedKey::new(address, storage_key, highest_block_number)
+            },
+        )
+    }
+
+    fn insert_account_history_index(
+        &self,
+        account_transitions: BTreeMap<Address, Vec<u64>>,
+    ) -> Result<()> {
+        self.append_history_index::<_, tables::AccountHistory>(account_transitions, ShardedKey::new)
+    }
+
+    fn unwind_storage_history_indices(&self, range: Range<BlockNumberAddress>) -> Result<usize> {
+        let storage_changesets = self
+            .tx
+            .cursor_read::<tables::StorageChangeSet>()?
+            .walk_range(range)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let changesets = storage_changesets.len();
+
+        let last_indices = storage_changesets
+            .into_iter()
+            // reverse so we can get lowest block number where we need to unwind account.
+            .rev()
+            // fold all storages and get last block number
+            .fold(
+                BTreeMap::new(),
+                |mut accounts: BTreeMap<(Address, H256), u64>, (index, storage)| {
+                    // we just need address and lowest block number.
+                    accounts.insert((index.address(), storage.key), index.block_number());
+                    accounts
+                },
+            );
+
+        let mut cursor = self.tx.cursor_write::<tables::StorageHistory>()?;
+        for ((address, storage_key), rem_index) in last_indices {
+            let partial_shard = unwind_history_shards::<_, tables::StorageHistory, _>(
+                &mut cursor,
+                StorageShardedKey::last(address, storage_key),
+                rem_index,
+                |storage_sharded_key| {
+                    storage_sharded_key.address == address &&
+                        storage_sharded_key.sharded_key.key == storage_key
+                },
+            )?;
+
+            // Check the last returned partial shard.
+            // If it's not empty, the shard needs to be reinserted.
+            if !partial_shard.is_empty() {
+                cursor.insert(
+                    StorageShardedKey::last(address, storage_key),
+                    BlockNumberList::new_pre_sorted(partial_shard),
+                )?;
+            }
+        }
+
+        Ok(changesets)
+    }
+
+    fn unwind_account_history_indices(&self, range: RangeInclusive<BlockNumber>) -> Result<usize> {
+        let account_changeset = self
+            .tx
+            .cursor_read::<tables::AccountChangeSet>()?
+            .walk_range(range)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let changesets = account_changeset.len();
+
+        let last_indices = account_changeset
+            .into_iter()
+            // reverse so we can get lowest block number where we need to unwind account.
+            .rev()
+            // fold all account and get last block number
+            .fold(BTreeMap::new(), |mut accounts: BTreeMap<Address, u64>, (index, account)| {
+                // we just need address and lowest block number.
+                accounts.insert(account.address, index);
+                accounts
+            });
+
+        // Unwind the account history index.
+        let mut cursor = self.tx.cursor_write::<tables::AccountHistory>()?;
+        for (address, rem_index) in last_indices {
+            let partial_shard = unwind_history_shards::<_, tables::AccountHistory, _>(
+                &mut cursor,
+                ShardedKey::last(address),
+                rem_index,
+                |sharded_key| sharded_key.key == address,
+            )?;
+
+            // Check the last returned partial shard.
+            // If it's not empty, the shard needs to be reinserted.
+            if !partial_shard.is_empty() {
+                cursor.insert(
+                    ShardedKey::last(address),
+                    BlockNumberList::new_pre_sorted(partial_shard),
+                )?;
+            }
+        }
+
+        Ok(changesets)
+    }
+}
+
+impl<'this, TX: DbTxMut<'this> + DbTx<'this>> BlockExecutionWriter for DatabaseProvider<'this, TX> {
+    /// Return range of blocks and its execution result
+    fn get_or_take_block_and_execution_range<const TAKE: bool>(
+        &self,
+        chain_spec: &ChainSpec,
+        range: RangeInclusive<BlockNumber>,
+    ) -> Result<Chain> {
+        if TAKE {
+            let storage_range = BlockNumberAddress::range(range.clone());
+
+            self.unwind_account_hashing(range.clone())?;
+            self.unwind_account_history_indices(range.clone())?;
+            self.unwind_storage_hashing(storage_range.clone())?;
+            self.unwind_storage_history_indices(storage_range)?;
+
+            // merkle tree
+            let (new_state_root, trie_updates) =
+                StateRoot::incremental_root_with_updates(&self.tx, range.clone())
+                    .map_err(Into::<reth_db::DatabaseError>::into)?;
+
+            let parent_number = range.start().saturating_sub(1);
+            let parent_state_root = self
+                .header_by_number(parent_number)?
+                .ok_or_else(|| ProviderError::HeaderNotFound(parent_number.into()))?
+                .state_root;
+
+            // state root should be always correct as we are reverting state.
+            // but for sake of double verification we will check it again.
+            if new_state_root != parent_state_root {
+                let parent_hash = self
+                    .block_hash(parent_number)?
+                    .ok_or_else(|| ProviderError::HeaderNotFound(parent_number.into()))?;
+                return Err(ProviderError::UnwindStateRootMismatch {
+                    got: new_state_root,
+                    expected: parent_state_root,
+                    block_number: parent_number,
+                    block_hash: parent_hash,
+                }
+                .into())
+            }
+            trie_updates.flush(&self.tx)?;
+        }
+        // get blocks
+        let blocks = self.get_take_block_range::<TAKE>(chain_spec, range.clone())?;
+        let unwind_to = blocks.first().map(|b| b.number.saturating_sub(1));
+        // get execution res
+        let execution_state = self.unwind_or_peek_state::<TAKE>(range.clone())?;
+
+        // remove block bodies it is needed for both get block range and get block execution results
+        // that is why it is deleted afterwards.
+        if TAKE {
+            // rm block bodies
+            self.get_or_take::<tables::BlockBodyIndices, TAKE>(range)?;
+
+            // Update pipeline progress
+            if let Some(fork_number) = unwind_to {
+                self.update_pipeline_stages(fork_number, true)?;
+            }
+        }
+
+        Ok(Chain::new(blocks, execution_state))
+    }
+}
+
+impl<'this, TX: DbTxMut<'this> + DbTx<'this>> BlockWriter for DatabaseProvider<'this, TX> {
+    fn insert_block(
+        &self,
+        block: SealedBlock,
+        senders: Option<Vec<Address>>,
+    ) -> Result<StoredBlockBodyIndices> {
+        let block_number = block.number;
+        self.tx.put::<tables::CanonicalHeaders>(block.number, block.hash())?;
+        // Put header with canonical hashes.
+        self.tx.put::<tables::Headers>(block.number, block.header.as_ref().clone())?;
+        self.tx.put::<tables::HeaderNumbers>(block.hash(), block.number)?;
+
+        // total difficulty
+        let ttd = if block.number == 0 {
+            block.difficulty
+        } else {
+            let parent_block_number = block.number - 1;
+            let parent_ttd =
+                self.tx.get::<tables::HeaderTD>(parent_block_number)?.unwrap_or_default();
+            parent_ttd.0 + block.difficulty
+        };
+
+        self.tx.put::<tables::HeaderTD>(block.number, ttd.into())?;
+
+        // insert body ommers data
+        if !block.ommers.is_empty() {
+            self.tx.put::<tables::BlockOmmers>(
+                block.number,
+                StoredBlockOmmers { ommers: block.ommers },
+            )?;
+        }
+
+        let mut next_tx_num = self
+            .tx
+            .cursor_read::<tables::Transactions>()?
+            .last()?
+            .map(|(n, _)| n + 1)
+            .unwrap_or_default();
+        let first_tx_num = next_tx_num;
+
+        let tx_count = block.body.len() as u64;
+
+        let senders_len = senders.as_ref().map(|s| s.len());
+        let tx_iter = if Some(block.body.len()) == senders_len {
+            block.body.into_iter().zip(senders.unwrap().into_iter()).collect::<Vec<(_, _)>>()
+        } else {
+            block
+                .body
+                .into_iter()
+                .map(|tx| {
+                    let signer = tx.recover_signer();
+                    (tx, signer.unwrap_or_default())
+                })
+                .collect::<Vec<(_, _)>>()
+        };
+
+        for (transaction, sender) in tx_iter {
+            let hash = transaction.hash();
+            self.tx.put::<tables::TxSenders>(next_tx_num, sender)?;
+            self.tx.put::<tables::Transactions>(next_tx_num, transaction.into())?;
+            self.tx.put::<tables::TxHashNumber>(hash, next_tx_num)?;
+            next_tx_num += 1;
+        }
+
+        if let Some(withdrawals) = block.withdrawals {
+            if !withdrawals.is_empty() {
+                self.tx.put::<tables::BlockWithdrawals>(
+                    block_number,
+                    StoredBlockWithdrawals { withdrawals },
+                )?;
+            }
+        }
+
+        let block_indices = StoredBlockBodyIndices { first_tx_num, tx_count };
+        self.tx.put::<tables::BlockBodyIndices>(block_number, block_indices.clone())?;
+
+        if !block_indices.is_empty() {
+            self.tx.put::<tables::TransactionBlock>(block_indices.last_tx_num(), block_number)?;
+        }
+
+        Ok(block_indices)
+    }
+
+    fn append_blocks_with_bundle_state(
+        &self,
+        blocks: Vec<SealedBlockWithSenders>,
+        state: BundleState,
+    ) -> Result<()> {
+        if blocks.is_empty() {
+            return Ok(())
+        }
+        let new_tip = blocks.last().unwrap();
+        let new_tip_number = new_tip.number;
+
+        let first_number = blocks.first().unwrap().number;
+
+        let last = blocks.last().unwrap();
+        let last_block_number = last.number;
+        let last_block_hash = last.hash();
+        let expected_state_root = last.state_root;
+
+        // Insert the blocks
+        for block in blocks {
+            let (block, senders) = block.into_components();
+            self.insert_block(block, Some(senders))?;
+        }
+
+        // Write state and changesets to the database.
+        // Must be written after blocks because of the receipt lookup.
+        state.write_to_db(self.tx_ref(), true)?;
+
+        self.insert_hashes(first_number..=last_block_number, last_block_hash, expected_state_root)?;
+
+        self.calculate_history_indices(first_number..=last_block_number)?;
+
+        // Update pipeline progress
+        self.update_pipeline_stages(new_tip_number, false)?;
+
+        Ok(())
     }
 }

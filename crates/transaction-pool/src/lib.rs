@@ -1,3 +1,9 @@
+#![cfg_attr(docsrs, feature(doc_cfg))]
+#![doc(
+    html_logo_url = "https://raw.githubusercontent.com/paradigmxyz/reth/main/assets/reth-docs.png",
+    html_favicon_url = "https://avatars0.githubusercontent.com/u/97369466?s=256",
+    issue_tracker_base_url = "https://github.com/paradigmxzy/reth/issues/"
+)]
 #![warn(missing_docs)]
 #![deny(
     unused_must_use,
@@ -79,32 +85,34 @@
 //! The transaction pool will be used by separate consumers (RPC, P2P), to make sharing easier, the
 //! [`Pool`](crate::Pool) type is just an `Arc` wrapper around `PoolInner`. This is the usable type
 //! that provides the `TransactionPool` interface.
-
-pub use crate::{
-    config::PoolConfig,
-    ordering::{CostOrdering, TransactionOrdering},
-    pool::TransactionEvents,
-    traits::{
-        AllPoolTransactions, BestTransactions, BlockInfo, CanonicalStateUpdate, ChangedAccount,
-        PoolTransaction, PooledTransaction, PropagateKind, PropagatedTransactions,
-        TransactionOrigin, TransactionPool,
-    },
-    validate::{
-        EthTransactionValidator, TransactionValidationOutcome, TransactionValidator,
-        ValidPoolTransaction,
-    },
-};
-use crate::{
-    error::PoolResult,
-    pool::PoolInner,
-    traits::{NewTransactionEvent, PoolSize},
-};
+//!
+//! ## Feature Flags
+//!
+//! - `serde` (default): Enable serde support
+//! - `test-utils`: Export utilities for testing
+use crate::pool::PoolInner;
 use aquamarine as _;
 use reth_primitives::{Address, TxHash, U256};
 use reth_provider::StateProviderFactory;
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::mpsc::Receiver;
 use tracing::{instrument, trace};
+
+pub use crate::{
+    config::PoolConfig,
+    error::PoolResult,
+    ordering::{GasCostOrdering, TransactionOrdering},
+    pool::TransactionEvents,
+    traits::{
+        AllPoolTransactions, BestTransactions, BlockInfo, CanonicalStateUpdate, ChangedAccount,
+        NewTransactionEvent, PoolSize, PoolTransaction, PooledTransaction, PropagateKind,
+        PropagatedTransactions, TransactionOrigin, TransactionPool,
+    },
+    validate::{
+        EthTransactionValidator, TransactionValidationOutcome, TransactionValidator,
+        ValidPoolTransaction,
+    },
+};
 
 mod config;
 pub mod error;
@@ -114,7 +122,7 @@ pub mod metrics;
 mod ordering;
 pub mod pool;
 mod traits;
-mod validate;
+pub mod validate;
 
 #[cfg(any(test, feature = "test-utils"))]
 /// Common test helpers for mocking A pool
@@ -137,6 +145,9 @@ pub(crate) const MAX_CODE_SIZE: usize = 24576;
 
 // Maximum initcode to permit in a creation transaction and create instructions
 pub(crate) const MAX_INIT_CODE_SIZE: usize = 2 * MAX_CODE_SIZE;
+
+// Price bump (in %) for the transaction pool underpriced check
+pub(crate) const PRICE_BUMP: u128 = 10;
 
 /// A shareable, generic, customizable `TransactionPool` implementation.
 #[derive(Debug)]
@@ -215,17 +226,17 @@ where
 }
 
 impl<Client>
-    Pool<EthTransactionValidator<Client, PooledTransaction>, CostOrdering<PooledTransaction>>
+    Pool<EthTransactionValidator<Client, PooledTransaction>, GasCostOrdering<PooledTransaction>>
 where
-    Client: StateProviderFactory,
+    Client: StateProviderFactory + Clone + 'static,
 {
     /// Returns a new [Pool] that uses the default [EthTransactionValidator] when validating
-    /// [PooledTransaction]s and ords via [CostOrdering]
+    /// [PooledTransaction]s and ords via [GasCostOrdering]
     pub fn eth_pool(
         validator: EthTransactionValidator<Client, PooledTransaction>,
         config: PoolConfig,
     ) -> Self {
-        Self::new(validator, CostOrdering::default(), config)
+        Self::new(validator, GasCostOrdering::default(), config)
     }
 }
 

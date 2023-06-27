@@ -1,6 +1,6 @@
 [package]
 name = "reth"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -87,7 +87,12 @@ humantime = "2.1.0"
 
 [features]
 jemalloc = ["dep:jemallocator"]
-only-info-logs = ["tracing/release_max_level_info"]
+jemalloc-prof = ["jemalloc", "jemallocator?/profiling"]
+min-error-logs = ["tracing/release_max_level_error"]
+min-warn-logs = ["tracing/release_max_level_warn"]
+min-info-logs = ["tracing/release_max_level_info"]
+min-debug-logs = ["tracing/release_max_level_debug"]
+min-trace-logs = ["tracing/release_max_level_trace"]
 
 [build-dependencies]
 vergen = { version = "8.0.0", features = ["build", "cargo", "git", "gitcl"] }

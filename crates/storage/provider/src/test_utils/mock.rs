@@ -1,8 +1,8 @@
 use crate::{
     change::BundleState,
     traits::{BlockSource, ReceiptProvider},
-    AccountProvider, BlockHashProvider, BlockIdProvider, BlockNumProvider, BlockProvider,
-    BlockProviderIdExt, EvmEnvProvider, HeaderProvider, PostStateDataProvider, StateProvider,
+    AccountReader, BlockHashReader, BlockIdReader, BlockNumReader, BlockReader, BlockReaderIdExt,
+    EvmEnvProvider, HeaderProvider, PostStateDataProvider, ReceiptProviderIdExt, StateProvider,
     StateProviderBox, StateProviderFactory, StateRootProvider, TransactionsProvider,
     WithdrawalsProvider,
 };
@@ -210,14 +210,14 @@ impl TransactionsProvider for MockEthProvider {
         Ok(map.into_values().collect())
     }
 
-    fn senders_by_tx_range(&self, _range: impl RangeBounds<TxNumber>) -> Result<Vec<Address>> {
-        unimplemented!()
-    }
-
     fn transactions_by_tx_range(
         &self,
         _range: impl RangeBounds<TxNumber>,
     ) -> Result<Vec<reth_primitives::TransactionSignedNoHash>> {
+        unimplemented!()
+    }
+
+    fn senders_by_tx_range(&self, _range: impl RangeBounds<TxNumber>) -> Result<Vec<Address>> {
         unimplemented!()
     }
 
@@ -240,7 +240,9 @@ impl ReceiptProvider for MockEthProvider {
     }
 }
 
-impl BlockHashProvider for MockEthProvider {
+impl ReceiptProviderIdExt for MockEthProvider {}
+
+impl BlockHashReader for MockEthProvider {
     fn block_hash(&self, number: u64) -> Result<Option<H256>> {
         let lock = self.blocks.lock();
 
@@ -260,7 +262,7 @@ impl BlockHashProvider for MockEthProvider {
     }
 }
 
-impl BlockNumProvider for MockEthProvider {
+impl BlockNumReader for MockEthProvider {
     fn chain_info(&self) -> Result<ChainInfo> {
         let best_block_number = self.best_block_number()?;
         let lock = self.headers.lock();
@@ -292,7 +294,7 @@ impl BlockNumProvider for MockEthProvider {
     }
 }
 
-impl BlockIdProvider for MockEthProvider {
+impl BlockIdReader for MockEthProvider {
     fn pending_block_num_hash(&self) -> Result<Option<reth_primitives::BlockNumHash>> {
         Ok(None)
     }
@@ -306,7 +308,7 @@ impl BlockIdProvider for MockEthProvider {
     }
 }
 
-impl BlockProvider for MockEthProvider {
+impl BlockReader for MockEthProvider {
     fn find_block_by_hash(&self, hash: H256, _source: BlockSource) -> Result<Option<Block>> {
         self.block(hash.into())
     }
@@ -323,6 +325,10 @@ impl BlockProvider for MockEthProvider {
         Ok(None)
     }
 
+    fn pending_block_and_receipts(&self) -> Result<Option<(SealedBlock, Vec<Receipt>)>> {
+        Ok(None)
+    }
+
     fn ommers(&self, _id: BlockHashOrNumber) -> Result<Option<Vec<Header>>> {
         Ok(None)
     }
@@ -336,7 +342,7 @@ impl BlockProvider for MockEthProvider {
     }
 }
 
-impl BlockProviderIdExt for MockEthProvider {
+impl BlockReaderIdExt for MockEthProvider {
     fn block_by_id(&self, id: BlockId) -> Result<Option<Block>> {
         match id {
             BlockId::Number(num) => self.block_by_number_or_tag(num),
@@ -363,7 +369,7 @@ impl BlockProviderIdExt for MockEthProvider {
     }
 }
 
-impl AccountProvider for MockEthProvider {
+impl AccountReader for MockEthProvider {
     fn basic_account(&self, address: Address) -> Result<Option<Account>> {
         Ok(self.accounts.lock().get(&address).cloned().map(|a| a.account))
     }

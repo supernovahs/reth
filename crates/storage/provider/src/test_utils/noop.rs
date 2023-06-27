@@ -1,8 +1,8 @@
 use crate::{
     change::BundleState,
     traits::{BlockSource, ReceiptProvider},
-    AccountProvider, BlockHashProvider, BlockIdProvider, BlockNumProvider, BlockProvider,
-    BlockProviderIdExt, EvmEnvProvider, HeaderProvider, StageCheckpointReader, StateProvider,
+    AccountReader, BlockHashReader, BlockIdReader, BlockNumReader, BlockReader, BlockReaderIdExt,
+    EvmEnvProvider, HeaderProvider, ReceiptProviderIdExt, StageCheckpointReader, StateProvider,
     StateProviderBox, StateProviderFactory, StateRootProvider, TransactionsProvider,
     WithdrawalsProvider,
 };
@@ -23,7 +23,7 @@ use std::ops::RangeBounds;
 pub struct NoopProvider;
 
 /// Noop implementation for testing purposes
-impl BlockHashProvider for NoopProvider {
+impl BlockHashReader for NoopProvider {
     fn block_hash(&self, _number: u64) -> Result<Option<H256>> {
         Ok(None)
     }
@@ -33,7 +33,7 @@ impl BlockHashProvider for NoopProvider {
     }
 }
 
-impl BlockNumProvider for NoopProvider {
+impl BlockNumReader for NoopProvider {
     fn chain_info(&self) -> Result<ChainInfo> {
         Ok(ChainInfo::default())
     }
@@ -51,7 +51,7 @@ impl BlockNumProvider for NoopProvider {
     }
 }
 
-impl BlockProvider for NoopProvider {
+impl BlockReader for NoopProvider {
     fn find_block_by_hash(&self, hash: H256, _source: BlockSource) -> Result<Option<Block>> {
         self.block(hash.into())
     }
@@ -61,6 +61,10 @@ impl BlockProvider for NoopProvider {
     }
 
     fn pending_block(&self) -> Result<Option<SealedBlock>> {
+        Ok(None)
+    }
+
+    fn pending_block_and_receipts(&self) -> Result<Option<(SealedBlock, Vec<Receipt>)>> {
         Ok(None)
     }
 
@@ -80,7 +84,7 @@ impl BlockProvider for NoopProvider {
     }
 }
 
-impl BlockProviderIdExt for NoopProvider {
+impl BlockReaderIdExt for NoopProvider {
     fn block_by_id(&self, _id: BlockId) -> Result<Option<Block>> {
         Ok(None)
     }
@@ -98,7 +102,7 @@ impl BlockProviderIdExt for NoopProvider {
     }
 }
 
-impl BlockIdProvider for NoopProvider {
+impl BlockIdReader for NoopProvider {
     fn pending_block_num_hash(&self) -> Result<Option<reth_primitives::BlockNumHash>> {
         Ok(None)
     }
@@ -180,6 +184,8 @@ impl ReceiptProvider for NoopProvider {
     }
 }
 
+impl ReceiptProviderIdExt for NoopProvider {}
+
 impl HeaderProvider for NoopProvider {
     fn header(&self, _block_hash: &BlockHash) -> Result<Option<Header>> {
         Ok(None)
@@ -213,7 +219,7 @@ impl HeaderProvider for NoopProvider {
     }
 }
 
-impl AccountProvider for NoopProvider {
+impl AccountReader for NoopProvider {
     fn basic_account(&self, _address: Address) -> Result<Option<Account>> {
         Ok(None)
     }

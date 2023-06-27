@@ -15,7 +15,7 @@ use fdlimit::raise_fd_limit;
 use futures::{future::Either, pin_mut, stream, stream_select, StreamExt};
 use reth_auto_seal_consensus::{AutoSealBuilder, AutoSealConsensus};
 use reth_basic_payload_builder::{BasicPayloadJobGenerator, BasicPayloadJobGeneratorConfig};
-use reth_beacon_consensus::{BeaconConsensus, BeaconConsensusEngine};
+use reth_beacon_consensus::{BeaconConsensus, BeaconConsensusEngine, MIN_BLOCKS_FOR_PIPELINE_RUN};
 use reth_blockchain_tree::{
     config::BlockchainTreeConfig, externals::TreeExternals, BlockchainTree, ShareableBlockchainTree,
 };
@@ -41,7 +41,7 @@ use reth_network::{error::NetworkError, NetworkConfig, NetworkHandle, NetworkMan
 use reth_network_api::NetworkInfo;
 use reth_primitives::{stage::StageId, BlockHashOrNumber, ChainSpec, Head, SealedHeader, H256};
 use reth_provider::{
-    BlockHashProvider, BlockProvider, CanonStateSubscriptions, HeaderProvider, ProviderFactory,
+    BlockHashReader, BlockReader, CanonStateSubscriptions, HeaderProvider, ProviderFactory,
     StageCheckpointReader,
 };
 use reth_revm::Factory;
@@ -76,6 +76,7 @@ use crate::{
 };
 use reth_interfaces::p2p::headers::client::HeadersClient;
 use reth_payload_builder::PayloadBuilderService;
+use reth_primitives::DisplayHardforks;
 use reth_provider::providers::BlockchainProvider;
 use reth_stages::stages::{
     AccountHashingStage, IndexAccountHistoryStage, IndexStorageHistoryStage, MerkleStage,
@@ -171,6 +172,8 @@ impl Command {
 
         let genesis_hash = init_genesis(db.clone(), self.chain.clone())?;
 
+        info!(target: "reth::cli", "{}", DisplayHardforks::from(self.chain.hardforks().clone()));
+
         let consensus: Arc<dyn Consensus> = if self.auto_mine {
             debug!(target: "reth::cli", "Using auto seal");
             Arc::new(AutoSealConsensus::new(Arc::clone(&self.chain)))
@@ -203,7 +206,12 @@ impl Command {
         let blockchain_db = BlockchainProvider::new(factory, blockchain_tree.clone())?;
 
         let transaction_pool = reth_transaction_pool::Pool::eth_pool(
-            EthTransactionValidator::new(blockchain_db.clone(), Arc::clone(&self.chain)),
+            EthTransactionValidator::new(
+                blockchain_db.clone(),
+                Arc::clone(&self.chain),
+                ctx.task_executor.clone(),
+                1,
+            ),
             Default::default(),
         );
         info!(target: "reth::cli", "Transaction pool initialized");
@@ -215,14 +223,11 @@ impl Command {
             let client = blockchain_db.clone();
             ctx.task_executor.spawn_critical(
                 "txpool maintenance task",
-                Box::pin(async move {
-                    reth_transaction_pool::maintain::maintain_transaction_pool(
-                        client,
-                        pool,
-                        chain_events,
-                    )
-                    .await
-                }),
+                reth_transaction_pool::maintain::maintain_transaction_pool_future(
+                    client,
+                    pool,
+                    chain_events,
+                ),
             );
             debug!(target: "reth::cli", "Spawned txpool maintenance task");
         }
@@ -233,10 +238,12 @@ impl Command {
         debug!(target: "reth::cli", ?network_secret_path, "Loading p2p key file");
         let secret_key = get_secret_key(&network_secret_path)?;
         let default_peers_path = data_dir.known_peers_path();
+        let head = self.lookup_head(Arc::clone(&db)).expect("the head block is missing");
         let network_config = self.load_network_config(
             &config,
             Arc::clone(&db),
             ctx.task_executor.clone(),
+            head,
             secret_key,
             default_peers_path.clone(),
         );
@@ -338,6 +345,7 @@ impl Command {
             self.debug.continuous,
             payload_builder.clone(),
             initial_target,
+            MIN_BLOCKS_FOR_PIPELINE_RUN,
             consensus_engine_tx,
             consensus_engine_rx,
         )?;
@@ -356,8 +364,10 @@ impl Command {
                 Either::Right(stream::empty())
             }
         );
-        ctx.task_executor
-            .spawn_critical("events task", events::handle_events(Some(network.clone()), events));
+        ctx.task_executor.spawn_critical(
+            "events task",
+            events::handle_events(Some(network.clone()), Some(head.number), events),
+        );
 
         let engine_api = EngineApi::new(
             blockchain_db.clone(),
@@ -388,7 +398,7 @@ impl Command {
         // Run consensus engine to completion
         let (tx, rx) = oneshot::channel();
         info!(target: "reth::cli", "Starting consensus engine");
-        ctx.task_executor.spawn_critical("consensus engine", async move {
+        ctx.task_executor.spawn_critical_blocking("consensus engine", async move {
             let res = beacon_consensus_engine.await;
             let _ = tx.send(res);
         });
@@ -488,7 +498,7 @@ impl Command {
         default_peers_path: PathBuf,
     ) -> Result<NetworkHandle, NetworkError>
     where
-        C: BlockProvider + HeaderProvider + Clone + Unpin + 'static,
+        C: BlockReader + HeaderProvider + Clone + Unpin + 'static,
         Pool: TransactionPool + Unpin + 'static,
     {
         let client = config.client.clone();
@@ -596,11 +606,10 @@ impl Command {
         config: &Config,
         db: Arc<Env<WriteMap>>,
         executor: TaskExecutor,
+        head: Head,
         secret_key: SecretKey,
         default_peers_path: PathBuf,
     ) -> NetworkConfig<ProviderFactory<Arc<Env<WriteMap>>>> {
-        let head = self.lookup_head(Arc::clone(&db)).expect("the head block is missing");
-
         self.network
             .network_config(config, self.chain.clone(), secret_key, default_peers_path)
             .with_task_executor(Box::new(executor))
@@ -716,7 +725,7 @@ async fn run_network_until_shutdown<C>(
     network: NetworkManager<C>,
     persistent_peers_file: Option<PathBuf>,
 ) where
-    C: BlockProvider + HeaderProvider + Clone + Unpin + 'static,
+    C: BlockReader + HeaderProvider + Clone + Unpin + 'static,
 {
     pin_mut!(network, shutdown);
 
@@ -777,14 +786,14 @@ mod tests {
 
     #[test]
     fn parse_metrics_port() {
-        let cmd = Command::try_parse_from(["reth", "--metrics", "9000"]).unwrap();
-        assert_eq!(cmd.metrics, Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9000)));
+        let cmd = Command::try_parse_from(["reth", "--metrics", "9001"]).unwrap();
+        assert_eq!(cmd.metrics, Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9001)));
 
-        let cmd = Command::try_parse_from(["reth", "--metrics", ":9000"]).unwrap();
-        assert_eq!(cmd.metrics, Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9000)));
+        let cmd = Command::try_parse_from(["reth", "--metrics", ":9001"]).unwrap();
+        assert_eq!(cmd.metrics, Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9001)));
 
-        let cmd = Command::try_parse_from(["reth", "--metrics", "localhost:9000"]).unwrap();
-        assert_eq!(cmd.metrics, Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9000)));
+        let cmd = Command::try_parse_from(["reth", "--metrics", "localhost:9001"]).unwrap();
+        assert_eq!(cmd.metrics, Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9001)));
     }
 
     #[test]

@@ -1,8 +1,10 @@
 //! utilities for working with revm
 
 use crate::eth::error::{EthApiError, EthResult, RpcInvalidTransactionError};
+use reth_interfaces::Error;
 use reth_primitives::{
-    AccessList, Address, TransactionSigned, TransactionSignedEcRecovered, TxHash, H256, U256,
+    constants::ETHEREUM_BLOCK_GAS_LIMIT, AccessList, Address, TransactionSigned,
+    TransactionSignedEcRecovered, TxHash, H256, U256,
 };
 use reth_revm::env::{fill_tx_env, fill_tx_env_with_recovered};
 use reth_rpc_types::{
@@ -10,15 +12,12 @@ use reth_rpc_types::{
     BlockOverrides, CallRequest,
 };
 use revm::{
-    db::State as RevmState,
+    db::{EmptyDBTyped, State as RevmState},
     precompile::{Precompiles, SpecId as PrecompilesSpecId},
     primitives::{BlockEnv, CfgEnv, Env, ResultAndState, SpecId, TransactTo, TxEnv},
     Database, Inspector,
 };
-use revm_primitives::{
-    db::{DatabaseCommit, DatabaseRef},
-    Bytecode,
-};
+use revm_primitives::db::DatabaseCommit;
 use tracing::trace;
 
 /// Helper type that bundles various overrides for EVM Execution.
@@ -43,6 +42,11 @@ impl EvmOverrides {
     /// Creates a new instance with the given state overrides.
     pub fn state(state: Option<StateOverride>) -> Self {
         Self { state, block: None }
+    }
+
+    /// Returns `true` if the overrides contain state overrides.
+    pub fn has_state(&self) -> bool {
+        self.state.is_some()
     }
 }
 
@@ -231,10 +235,21 @@ where
         apply_block_overrides(*block_overrides, &mut env.block);
     }
 
-    if request_gas.is_none() && env.tx.gas_price > U256::ZERO {
-        trace!(target: "rpc::eth::call", ?env, "Applying gas limit cap");
-        // no gas limit was provided in the request, so we need to cap the request's gas limit
-        cap_tx_gas_limit_with_caller_allowance(db, &mut env.tx)?;
+    if request_gas.is_none() {
+        // No gas limit was provided in the request, so we need to cap the transaction gas limit
+        if env.tx.gas_price > U256::ZERO {
+            // If gas price is specified, cap transaction gas limit with caller allowance
+            trace!(target: "rpc::eth::call", ?env, "Applying gas limit cap with caller allowance");
+            cap_tx_gas_limit_with_caller_allowance(db, &mut env.tx)?;
+        } else {
+            // If no gas price is specified, use maximum allowed gas limit. The reason for this is
+            // that both Erigon and Geth use pre-configured gas cap even if it's possible
+            // to derive the gas limit from the block:
+            // https://github.com/ledgerwatch/erigon/blob/eae2d9a79cb70dbe30b3a6b79c436872e4605458/cmd/rpcdaemon/commands/trace_adhoc.go#L956
+            // https://github.com/ledgerwatch/erigon/blob/eae2d9a79cb70dbe30b3a6b79c436872e4605458/eth/ethconfig/config.go#L94
+            trace!(target: "rpc::eth::call", ?env, "Applying gas limit cap as the maximum gas limit");
+            env.tx.gas_limit = ETHEREUM_BLOCK_GAS_LIMIT;
+        }
     }
 
     Ok(env)
@@ -300,29 +315,43 @@ pub(crate) fn create_txn_env(block_env: &BlockEnv, request: CallRequest) -> EthR
 }
 
 /// Caps the configured [TxEnv] `gas_limit` with the allowance of the caller.
-///
-/// Returns an error if the caller has insufficient funds
-pub(crate) fn cap_tx_gas_limit_with_caller_allowance<DB>(
-    mut db: DB,
-    env: &mut TxEnv,
-) -> EthResult<()>
+pub(crate) fn cap_tx_gas_limit_with_caller_allowance<DB>(db: DB, env: &mut TxEnv) -> EthResult<()>
 where
     DB: Database,
     EthApiError: From<<DB as Database>::Error>,
 {
-    let mut allowance = db.basic(env.caller)?.map(|acc| acc.balance).unwrap_or_default();
-
-    // subtract transferred value
-    allowance = allowance
-        .checked_sub(env.value)
-        .ok_or_else(|| RpcInvalidTransactionError::InsufficientFunds)?;
-
-    // cap the gas limit
-    if let Ok(gas_limit) = allowance.checked_div(env.gas_price).unwrap_or_default().try_into() {
+    if let Ok(gas_limit) = caller_gas_allowance(db, env)?.try_into() {
         env.gas_limit = gas_limit;
     }
 
     Ok(())
+}
+
+/// Calculates the caller gas allowance.
+///
+/// `allowance = (account.balance - tx.value) / tx.gas_price`
+///
+/// Returns an error if the caller has insufficient funds.
+/// Caution: This assumes non-zero `env.gas_price`. Otherwise, zero allowance will be returned.
+pub(crate) fn caller_gas_allowance<DB>(mut db: DB, env: &TxEnv) -> EthResult<U256>
+where
+    DB: Database,
+    EthApiError: From<<DB as Database>::Error>,
+{
+    Ok(db
+        // Get the caller account.
+        .basic(env.caller)?
+        // Get the caller balance.
+        .map(|acc| acc.balance)
+        .unwrap_or_default()
+        // Subtract transferred value from the caller balance.
+        .checked_sub(env.value)
+        // Return error if the caller has insufficient funds.
+        .ok_or_else(|| RpcInvalidTransactionError::InsufficientFunds)?
+        // Calculate the amount of gas the caller can afford with the specified gas price.
+        .checked_div(env.gas_price)
+        // This will be 0 if gas price is 0. It is fine, because we check it before.
+        .unwrap_or_default())
 }
 
 /// Helper type for representing the fees of a [CallRequest]
@@ -435,7 +464,7 @@ where
     DB: Database,
     EthApiError: From<DB::Error>,
 {
-    // TODO rakita
+    // TODO(rakita) revm state
     /*
     let mut account_info = db.basic(account)?.unwrap_or_default();
 
@@ -483,4 +512,19 @@ where
     */
 
     Ok(())
+}
+
+/// This clones and transforms the given [CacheDB] with an arbitrary [DatabaseRef] into a new
+/// [CacheDB] with [EmptyDB] as the database type
+#[inline]
+pub(crate) fn clone_into_empty_db<DBError>(
+    db: &RevmState<'_, DBError>,
+) -> RevmState<'static, DBError> {
+    let database = Box::new(EmptyDBTyped::<DBError>::new());
+    RevmState {
+        cache: db.cache.clone(),
+        database,
+        transition_builder: db.transition_builder.clone(),
+        has_state_clear: db.has_state_clear,
+    }
 }
