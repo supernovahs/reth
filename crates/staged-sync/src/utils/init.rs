@@ -10,7 +10,7 @@ use reth_db::{
 };
 use reth_primitives::{stage::StageId, Account, Bytecode, ChainSpec, StorageEntry, H256, U256};
 use reth_provider::{
-    BundleState, DatabaseProviderRW, HashingWriter, HistoryWriter, ProviderFactory,
+    BundleState, DatabaseProviderRW, HashingWriter, HistoryWriter, ProviderFactory, change::BundleStateInit,
 };
 use std::{collections::BTreeMap, fs, path::Path, sync::Arc};
 use tracing::debug;
@@ -115,32 +115,34 @@ pub fn insert_genesis_state<DB: Database>(
     let mut state = BundleState::default();
 
     // TODO(rakita) bundle state;
-    /*
-    for (address, account) in &genesis.alloc {
-        let mut bytecode_hash = None;
-        if let Some(code) = &account.code {
-            let bytecode = Bytecode::new_raw(code.0.clone());
-            // FIXME: Can bytecode_hash be Some(Bytes::new()) here?
-            let hash = bytecode.hash_slow();
-            bytecode_hash = Some(hash);
-            state.add_bytecode(hash, bytecode);
-        }
-        state.create_account(
-            0,
-            *address,
-            Account { nonce: account.nonce.unwrap_or(0), balance: account.balance, bytecode_hash },
-        );
-        if let Some(storage) = &account.storage {
-            let mut storage_changes = reth_provider::post_state::StorageChangeset::new();
-            for (&key, &value) in storage {
-                storage_changes
-                    .insert(U256::from_be_bytes(key.0), (U256::ZERO, U256::from_be_bytes(value.0)));
-            }
-            state.change_storage(0, *address, storage_changes);
-        }
-    }
-    state.write_to_db(tx)?;
-     */
+    let t : BundleStateInit = HashMap::new();
+
+
+
+    // for (address, account) in &genesis.alloc {
+    //     let mut bytecode_hash = None;
+    //     if let Some(code) = &account.code {
+    //         let bytecode = Bytecode::new_raw(code.0.clone());
+    //         // FIXME: Can bytecode_hash be Some(Bytes::new()) here?
+    //         let hash = bytecode.hash_slow();
+    //         bytecode_hash = Some(hash);
+    //         state.add_bytecode(hash, bytecode);
+    //     }
+    //     state.create_account(
+    //         0,
+    //         *address,
+    //         Account { nonce: account.nonce.unwrap_or(0), balance: account.balance, bytecode_hash },
+    //     );
+    //     if let Some(storage) = &account.storage {
+    //         let mut storage_changes = reth_provider::post_state::StorageChangeset::new();
+    //         for (&key, &value) in storage {
+    //             storage_changes
+    //                 .insert(U256::from_be_bytes(key.0), (U256::ZERO, U256::from_be_bytes(value.0)));
+    //         }
+    //         state.change_storage(0, *address, storage_changes);
+    //     }
+    // }
+    // state.write_to_db(tx)?;
 
     Ok(())
 }

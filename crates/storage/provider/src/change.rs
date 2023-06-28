@@ -38,7 +38,7 @@ pub struct BundleState {
 
 /// Type used to initialize revms bundle state.
 pub type BundleStateInit =
-    HashMap<Address, (Option<(Option<Account>, Option<Account>)>, HashMap<H256, (U256, U256)>)>;
+    HashMap<Address, (Option<Account>, Option<Account>, HashMap<H256, (U256, U256)>)>;
 
 impl BundleState {
     /// Create Bundle State.
@@ -149,11 +149,11 @@ impl BundleState {
     /// Transform block number to the index of block.
     fn block_number_to_index(&self, block_number: BlockNumber) -> Option<usize> {
         if block_number > self.first_block {
-            return None
+            return None;
         }
         let index = block_number - self.first_block;
         if index > self.receipts.len() as u64 {
-            return None
+            return None;
         }
         Some(index as usize)
     }
@@ -184,16 +184,16 @@ impl BundleState {
         first_block: BlockNumber,
     ) -> Self {
         // initialize revm bundle
-        let bundle =
-            RevmBundleState::new(bundle_init.into_iter().map(|(address, (info, storage))| {
+        let bundle = RevmBundleState::new(bundle_init.into_iter().map(
+            |(address, (original, present, storage))| {
                 (
                     address,
-                    info.map(|(original, present)| {
-                        (original.map(into_revm_acc), present.map(into_revm_acc))
-                    }),
+                    original.map(into_revm_acc),
+                    present.map(into_revm_acc),
                     storage.into_iter().map(|(k, s)| (k.into(), s)).collect(),
                 )
-            }));
+            },
+        ));
 
         Self { bundle, receipts, first_block }
     }
@@ -253,10 +253,10 @@ impl BundleState {
         let last_block = self.last_block();
         let first_block = self.first_block;
         if block_number >= last_block {
-            return None
+            return None;
         }
         if block_number < first_block {
-            return Some(Self::default())
+            return Some(Self::default());
         }
 
         let num_of_detached_block = block_number - first_block;
