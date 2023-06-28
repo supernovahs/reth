@@ -197,16 +197,15 @@ where
 /// Prepares the [Env] for execution.
 ///
 /// Does not commit any changes to the underlying database.
-pub(crate) fn prepare_call_env<DB>(
+pub(crate) fn prepare_call_env(
     mut cfg: CfgEnv,
     block: BlockEnv,
     request: CallRequest,
-    db: &mut RevmState<'_, DB::Error>,
+    db: &mut RevmState<'_, Error>,
     overrides: EvmOverrides,
 ) -> EthResult<Env>
 where
-    DB: Database,
-    EthApiError: From<DB::Error>,
+    EthApiError: From<Error>,
 {
     // we want to disable this in eth_call, since this is common practice used by other node
     // impls and providers <https://github.com/foundry-rs/foundry/issues/4388>
@@ -227,7 +226,7 @@ where
 
     // apply state overrides
     if let Some(state_overrides) = overrides.state {
-        apply_state_overrides::<DB>(state_overrides, db)?;
+        apply_state_overrides(state_overrides, db)?;
     }
 
     // apply block overrides
@@ -440,29 +439,24 @@ fn apply_block_overrides(overrides: BlockOverrides, env: &mut BlockEnv) {
 }
 
 /// Applies the given state overrides (a set of [AccountOverride]) to the [CacheDB].
-fn apply_state_overrides<DB>(
-    overrides: StateOverride,
-    db: &mut RevmState<'_, DB::Error>,
-) -> EthResult<()>
+fn apply_state_overrides(overrides: StateOverride, db: &mut RevmState<'_, Error>) -> EthResult<()>
 where
-    DB: Database,
-    EthApiError: From<DB::Error>,
+    EthApiError: From<Error>,
 {
     for (account, account_overrides) in overrides {
-        apply_account_override::<DB>(account, account_overrides, db)?;
+        apply_account_override(account, account_overrides, db)?;
     }
     Ok(())
 }
 
 /// Applies a single [AccountOverride] to the [CacheDB].
-fn apply_account_override<DB>(
+fn apply_account_override(
     account: Address,
     account_override: AccountOverride,
-    db: &mut RevmState<'_, DB::Error>,
+    db: &mut RevmState<'_, Error>,
 ) -> EthResult<()>
 where
-    DB: Database,
-    EthApiError: From<DB::Error>,
+    EthApiError: From<Error>,
 {
     // TODO(rakita) revm state
     /*

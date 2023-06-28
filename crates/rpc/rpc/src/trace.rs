@@ -28,7 +28,7 @@ use reth_rpc_types::{
     BlockError, BlockOverrides, CallRequest, Index, TransactionInfo,
 };
 use reth_tasks::TaskSpawner;
-use revm::{db::State as RevmState, primitives::Env};
+use revm::{db::State as RevmState, primitives::Env, DatabaseCommit};
 use revm_primitives::{ExecutionResult, ResultAndState};
 use std::{collections::HashSet, future::Future, sync::Arc};
 use tokio::sync::{oneshot, AcquireError, OwnedSemaphorePermit};
@@ -193,25 +193,45 @@ where
             this.inner.eth_api.with_state_at_block(at, move |state| {
                 let mut results = Vec::with_capacity(calls.len());
                 let provider = Box::new(State::new(state));
-                let mut state = RevmState::new_without_transitions(provider);
+                let mut revm_state = RevmState::new_without_transitions(provider);
 
-                for (call, trace_types) in calls {
-                    let env = prepare_call_env::<RevmState<'_, Error>>(
+                let mut calls = calls.into_iter().peekable();
+
+                while let Some((call, trace_types)) = calls.next() {
+                    let env = prepare_call_env(
                         cfg.clone(),
                         block_env.clone(),
                         call,
-                        &mut state,
+                        &mut revm_state,
                         Default::default(),
                     )?;
                     let config = tracing_config(&trace_types);
                     let mut inspector = TracingInspector::new(config);
-                    let (res, _) = inspect(&mut state, env, &mut inspector)?;
-                    let trace_res = inspector.into_parity_builder().into_trace_results_with_state(
-                        res,
-                        &trace_types,
-                        &mut state,
-                    )?;
+                    let (res, _) = inspect(&mut revm_state, env, &mut inspector)?;
+                    let ResultAndState { result, state } = res;
+
+                    let mut trace_res =
+                        inspector.into_parity_builder().into_trace_results(result, &trace_types);
+
+                    // If statediffs were requested, populate them with the account balance and
+                    // nonce from pre-state
+                    if let Some(ref mut state_diff) = trace_res.state_diff {
+                        populate_account_balance_nonce_diffs(
+                            state_diff,
+                            &mut revm_state,
+                            state.iter().map(|(addr, acc)| (*addr, acc.info.clone())),
+                        )?;
+                    }
+
                     results.push(trace_res);
+
+                    // need to apply the state changes of this call before executing the
+                    // next call
+                    if calls.peek().is_some() {
+                        // need to apply the state changes of this call before executing
+                        // the next call
+                        revm_state.commit(state)
+                    }
                 }
 
                 Ok(results)
@@ -406,6 +426,9 @@ where
             move |tx_info, inspector, res, state, db| {
                 let mut full_trace =
                     inspector.into_parity_builder().into_trace_results(res, &trace_types);
+
+                // If statediffs were requested, populate them with the account balance and nonce
+                // from pre-state
                 if let Some(ref mut state_diff) = full_trace.state_diff {
                     populate_account_balance_nonce_diffs(
                         state_diff,

@@ -97,6 +97,7 @@ use reth_provider::StateProviderFactory;
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::mpsc::Receiver;
 use tracing::{instrument, trace};
+use traits::TransactionPoolExt;
 
 pub use crate::{
     config::PoolConfig,
@@ -178,13 +179,6 @@ where
         self.inner().config()
     }
 
-    /// Sets the current block info for the pool.
-    #[instrument(skip(self), target = "txpool")]
-    pub fn set_block_info(&self, info: BlockInfo) {
-        trace!(target: "txpool", "updating pool block info");
-        self.pool.set_block_info(info)
-    }
-
     /// Returns future that validates all transaction in the given iterator.
     async fn validate_all(
         &self,
@@ -255,10 +249,6 @@ where
 
     fn block_info(&self) -> BlockInfo {
         self.pool.block_info()
-    }
-
-    fn on_canonical_state_change(&self, update: CanonicalStateUpdate) {
-        self.pool.on_canonical_state_change(update);
     }
 
     async fn add_transaction_and_subscribe(
@@ -366,6 +356,22 @@ where
         sender: Address,
     ) -> Vec<Arc<ValidPoolTransaction<Self::Transaction>>> {
         self.pool.get_transactions_by_sender(sender)
+    }
+}
+
+impl<V: TransactionValidator, T: TransactionOrdering> TransactionPoolExt for Pool<V, T>
+where
+    V: TransactionValidator,
+    T: TransactionOrdering<Transaction = <V as TransactionValidator>::Transaction>,
+{
+    #[instrument(skip(self), target = "txpool")]
+    fn set_block_info(&self, info: BlockInfo) {
+        trace!(target: "txpool", "updating pool block info");
+        self.pool.set_block_info(info)
+    }
+
+    fn on_canonical_state_change(&self, update: CanonicalStateUpdate) {
+        self.pool.on_canonical_state_change(update);
     }
 }
 

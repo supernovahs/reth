@@ -503,8 +503,7 @@ where
         let state = self.state_at(at)?;
         let mut db = RevmState::new_without_transitions(Box::new(State::new(state)));
 
-        let env =
-            prepare_call_env::<StateCacheDB<'_>>(cfg, block_env, request, &mut db, overrides)?;
+        let env = prepare_call_env(cfg, block_env, request, &mut db, overrides)?;
         f(db, env)
     }
 
@@ -544,8 +543,7 @@ where
         let state = self.state_at(at)?;
         let mut db = RevmState::new_without_transitions(Box::new(State::new(state)));
 
-        let env =
-            prepare_call_env::<StateCacheDB<'_>>(cfg, block_env, request, &mut db, overrides)?;
+        let env = prepare_call_env(cfg, block_env, request, &mut db, overrides)?;
         inspect_and_return_db(db, env, inspector)
     }
 
