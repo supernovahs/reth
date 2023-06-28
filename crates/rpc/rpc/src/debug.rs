@@ -436,7 +436,7 @@ where
     fn spawn_js_trace_service(
         &self,
         at: BlockId,
-        db: Option<RevmState<'_, Error>>,
+        db: Option<RevmState<'static, Error>>,
     ) -> EthResult<mpsc::Sender<JsDbRequest>> {
         let (to_db_service, rx) = mpsc::channel(1);
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
@@ -474,7 +474,7 @@ where
             }
         };
 
-        let db = if let Some(db) = db {
+        let mut db = if let Some(db) = db {
             let RevmState { cache, database, transition_builder, has_state_clear } = db;
             RevmState {
                 cache,
@@ -491,6 +491,7 @@ where
             match req {
                 JsDbRequest::Basic { address, resp } => {
                     let acc = db
+                        .database
                         .basic(address)
                         .map(|maybe_acc| {
                             maybe_acc.map(|acc| Account {
@@ -504,13 +505,14 @@ where
                 }
                 JsDbRequest::Code { code_hash, resp } => {
                     let code = db
+                        .database
                         .code_by_hash(code_hash)
                         .map(|code| code.bytecode)
                         .map_err(|err| err.to_string());
                     let _ = resp.send(code);
                 }
                 JsDbRequest::StorageAt { address, index, resp } => {
-                    let value = db.storage(address, index).map_err(|err| err.to_string());
+                    let value = db.database.storage(address, index).map_err(|err| err.to_string());
                     let _ = resp.send(value);
                 }
             }

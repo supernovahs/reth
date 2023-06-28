@@ -517,7 +517,7 @@ where
 /// This clones and transforms the given [CacheDB] with an arbitrary [DatabaseRef] into a new
 /// [CacheDB] with [EmptyDB] as the database type
 #[inline]
-pub(crate) fn clone_into_empty_db<DBError>(
+pub(crate) fn clone_into_empty_db<DBError: Send + 'static>(
     db: &RevmState<'_, DBError>,
 ) -> RevmState<'static, DBError> {
     let database = Box::new(EmptyDBTyped::<DBError>::new());
