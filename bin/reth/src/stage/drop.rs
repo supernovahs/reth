@@ -157,6 +157,13 @@ impl Command {
                     )?;
                     insert_genesis_header::<Env<WriteMap>>(tx, self.chain)?;
                 }
+                StageEnum::TxLookup => {
+                    tx.clear::<tables::TxHashNumber>()?;
+                    tx.put::<tables::SyncStage>(
+                        StageId::TransactionLookup.to_string(),
+                        Default::default(),
+                    )?;
+                }
                 _ => {
                     info!("Nothing to do for stage {:?}", self.stage);
                     return Ok(())

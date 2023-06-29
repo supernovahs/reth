@@ -183,7 +183,7 @@ where
 
                     match execute_block(&state, &block, Some(senders.clone()), chain_spec) {
                         Ok((gas_used, bundle_state)) => {
-                            // apply post block changes
+                            // TODO(rakita) apply post block changes
                             //executor.post_execution_state_change(&block, U256::ZERO).unwrap();
 
                             //let bundle_state = executor.take_output_state();

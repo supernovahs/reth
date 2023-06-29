@@ -1,5 +1,5 @@
 use crate::{
-    change::{BundleState, BundleStateInit},
+    change::{BundleState, BundleStateInit, RevertsInit},
     traits::{AccountExtReader, BlockSource, ReceiptProvider, StageCheckpointWriter},
     AccountReader, BlockExecutionWriter, BlockHashReader, BlockNumReader, BlockReader, BlockWriter,
     Chain, EvmEnvProvider, HashingWriter, HeaderProvider, HistoryWriter, ProviderError,
@@ -227,11 +227,7 @@ impl<'this, TX: DbTxMut<'this> + DbTx<'this>> DatabaseProvider<'this, TX> {
         let mut plain_accounts_cursor = self.tx.cursor_write::<tables::PlainAccountState>()?;
         let mut plain_storage_cursor = self.tx.cursor_dup_write::<tables::PlainStorageState>()?;
 
-        type AccountReverts = HashMap<BlockNumber, Vec<(Address, Option<Account>)>>;
-        type StorageReverts = HashMap<BlockNumber, Vec<(Address, Vec<StorageEntry>)>>;
-
-        let mut account_reverts: AccountReverts = HashMap::new();
-        let mut storage_reverts: StorageReverts = HashMap::new();
+        let mut reverts: RevertsInit = HashMap::new();
 
         // add account changeset changes
         for (block_number, account_before) in account_changeset.into_iter().rev() {
@@ -246,8 +242,8 @@ impl<'this, TX: DbTxMut<'this> + DbTx<'this>> DatabaseProvider<'this, TX> {
                     entry.get_mut().0 = old_info;
                 }
             }
-
-            account_reverts.entry(block_number).or_default().push((address, old_info));
+            // insert old info into reverts.
+            reverts.entry(block_number).or_default().entry(address).or_default().0 = Some(old_info);
         }
 
         // add storage changeset changes
@@ -276,16 +272,13 @@ impl<'this, TX: DbTxMut<'this> + DbTx<'this>> DatabaseProvider<'this, TX> {
                 }
             };
 
-            let reverts = storage_reverts.entry(block_number).or_default();
-            if let Some((last_address, list)) = reverts.last_mut() {
-                if *last_address == address {
-                    list.push(old_storage)
-                } else {
-                    reverts.push((address, vec![(old_storage)]));
-                }
-            } else {
-                reverts.push((address, vec![(old_storage)]));
-            }
+            reverts
+                .entry(block_number)
+                .or_default()
+                .entry(address)
+                .or_default()
+                .1
+                .push(old_storage);
         }
 
         if UNWIND {
@@ -340,7 +333,7 @@ impl<'this, TX: DbTxMut<'this> + DbTx<'this>> DatabaseProvider<'this, TX> {
             receipts.push(block_receipt);
         }
 
-        Ok(BundleState::new_init(state, receipts, start_block_number))
+        Ok(BundleState::new_init(state, reverts, Vec::new(), receipts, start_block_number))
     }
 
     /// Return list of entries from table

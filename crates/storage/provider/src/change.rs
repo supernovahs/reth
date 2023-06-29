@@ -40,6 +40,12 @@ pub struct BundleState {
 pub type BundleStateInit =
     HashMap<Address, (Option<Account>, Option<Account>, HashMap<H256, (U256, U256)>)>;
 
+/// Types used inside RevertsInit to initialize revms reverts.
+pub type AccountRevertInit = (Option<Option<Account>>, Vec<StorageEntry>);
+
+/// Type used to initialize revms reverts.
+pub type RevertsInit = HashMap<BlockNumber, HashMap<Address, AccountRevertInit>>;
+
 impl BundleState {
     /// Create Bundle State.
     pub fn new(
@@ -47,6 +53,39 @@ impl BundleState {
         receipts: Vec<Vec<Receipt>>,
         first_block: BlockNumber,
     ) -> Self {
+        Self { bundle, receipts, first_block }
+    }
+
+    /// Create new bundle state with receipts.
+    pub fn new_init(
+        state_init: BundleStateInit,
+        revert_init: RevertsInit,
+        contracts_init: Vec<(H256, Bytecode)>,
+        receipts: Vec<Vec<Receipt>>,
+        first_block: BlockNumber,
+    ) -> Self {
+        // initialize revm bundle
+        let bundle = RevmBundleState::new(
+            state_init.into_iter().map(|(address, (original, present, storage))| {
+                (
+                    address,
+                    original.map(into_revm_acc),
+                    present.map(into_revm_acc),
+                    storage.into_iter().map(|(k, s)| (k.into(), s)).collect(),
+                )
+            }),
+            revert_init.into_iter().map(|(_, reverts)| {
+                reverts.into_iter().map(|(address, (original, storage))| {
+                    (
+                        address,
+                        original.map(|i| i.map(into_revm_acc)),
+                        storage.into_iter().map(|entry| (entry.key.into(), entry.value)),
+                    )
+                })
+            }),
+            contracts_init.into_iter().map(|(code_hash, bytecode)| (code_hash, bytecode.0)),
+        );
+
         Self { bundle, receipts, first_block }
     }
 
@@ -177,29 +216,6 @@ impl BundleState {
         Some(calculate_receipt_root_ref(&self.receipts[index]))
     }
 
-    /// Create new bundle state with receipts.
-    pub fn new_init(
-        bundle_init: BundleStateInit,
-        receipts: Vec<Vec<Receipt>>,
-        first_block: BlockNumber,
-    ) -> Self {
-        // initialize revm bundle
-        let bundle = RevmBundleState::new(bundle_init.into_iter().map(
-            |(address, (original, present, storage))| {
-                (
-                    address,
-                    original.map(into_revm_acc),
-                    present.map(into_revm_acc),
-                    storage.into_iter().map(|(k, s)| (k.into(), s)).collect(),
-                )
-            },
-        ));
-
-        Self { bundle, receipts, first_block }
-    }
-
-    //pub fn account
-
     /// Return reference to receipts.
     pub fn receipts(&self) -> &Vec<Vec<Receipt>> {
         &self.receipts
@@ -286,6 +302,9 @@ impl BundleState {
     }
 
     /// Write bundle state to database.
+    ///
+    /// `omit_changed_check` should be set to true of bundle has some of it data
+    /// detached, This would make some original values not known.
     pub fn write_to_db<'a, TX: DbTxMut<'a> + DbTx<'a>>(
         mut self,
         tx: &TX,

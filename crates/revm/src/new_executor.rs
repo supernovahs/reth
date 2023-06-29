@@ -17,7 +17,7 @@ use reth_primitives::{
 use reth_provider::{change::BundleState, BlockExecutor, StateProvider};
 use revm::{primitives::ResultAndState, DatabaseCommit, State as RevmState, EVM};
 use std::sync::Arc;
-use tracing::debug;
+use tracing::{debug, trace};
 
 /// Main block executor
 pub struct NewExecutor<'a> {
@@ -134,7 +134,7 @@ impl<'a> NewExecutor<'a> {
             // return balance to DAO beneficiary.
             *balance_increments.entry(DAO_HARDFORK_BENEFICIARY).or_default() += drained_balance;
         }
-
+        trace!(target: "sync", "Balance increments: {:?}", balance_increments);
         // increment balances
         self.db()
             .increment_balances(

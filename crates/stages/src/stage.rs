@@ -77,7 +77,7 @@ impl ExecInput {
         &self,
         provider: &DatabaseProviderRW<'_, DB>,
         tx_threshold: u64,
-    ) -> Result<(RangeInclusive<TxNumber>, RangeInclusive<BlockNumber>, bool), StageError> {
+    ) -> Result<(Range<TxNumber>, RangeInclusive<BlockNumber>, bool), StageError> {
         let start_block = self.next_block();
         let start_block_body = provider.block_body_indices(start_block)?;
 

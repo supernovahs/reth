@@ -1479,7 +1479,7 @@ mod tests {
         }
 
         /// Set the executor results to use for the test consensus engine.
-        fn with_executor_results(mut self, executor_results: Vec<PostState>) -> Self {
+        fn with_executor_results(mut self, executor_results: Vec<BundleState>) -> Self {
             self.executor_results = executor_results;
             self
         }
