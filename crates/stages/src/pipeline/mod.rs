@@ -399,7 +399,7 @@ where
                     // TODO(rakita) temporary hack to stop unwind
                     error!("Stage error: {:?}", err);
                     panic!("Stop execution");
-                    
+
                     self.listeners.notify(PipelineEvent::Error { stage_id });
 
                     let out = if let StageError::DetachedHead { local_head, header, error } = err {

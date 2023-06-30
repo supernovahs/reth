@@ -1,14 +1,14 @@
 use crate::error::StageError;
 use async_trait::async_trait;
-use reth_db::{cursor::DbCursorRO, database::Database, tables, transaction::DbTx};
+use reth_db::database::Database;
 use reth_primitives::{
     stage::{StageCheckpoint, StageId},
     BlockNumber, TxNumber,
 };
-use reth_provider::DatabaseProviderRW;
+use reth_provider::{BlockReader, DatabaseProviderRW, ProviderError, TransactionsProvider};
 use std::{
     cmp::{max, min},
-    ops::RangeInclusive,
+    ops::{Range, RangeInclusive},
 };
 
 /// Stage execution input, see [Stage::execute].
@@ -79,26 +79,38 @@ impl ExecInput {
         tx_threshold: u64,
     ) -> Result<(Range<TxNumber>, RangeInclusive<BlockNumber>, bool), StageError> {
         let start_block = self.next_block();
-        let start_block_body = provider.block_body_indices(start_block)?;
-
         let target_block = self.target();
 
-        let first_tx_number = start_block_body.first_tx_num();
-        let mut last_tx_number = start_block_body.last_tx_num();
-        let mut end_block_number = start_block;
-        let mut body_indices_cursor =
-            provider.tx_ref().cursor_read::<tables::BlockBodyIndices>()?;
-        for entry in body_indices_cursor.walk_range(start_block..=target_block)? {
-            let (block, body) = entry?;
-            last_tx_number = body.last_tx_num();
-            end_block_number = block;
-            let tx_count = (first_tx_number..=last_tx_number).count() as u64;
-            if tx_count > tx_threshold {
-                break
-            }
+        let start_block_body = provider.block_body_indices(start_block)?;
+        let first_tx_num = start_block_body.first_tx_num();
+
+        let target_block_body = provider.block_body_indices(target_block)?;
+
+        // number of transactions left to execute.
+        let all_tx_cnt = target_block_body.next_tx_num() - first_tx_num;
+
+        if all_tx_cnt == 0 {
+            // if there is no more transaction return back.
+            return Ok((first_tx_num..first_tx_num, start_block..=target_block, true))
         }
-        let is_final_range = end_block_number >= target_block;
-        Ok((first_tx_number..=last_tx_number, start_block..=end_block_number, is_final_range))
+
+        let tx_cnt: u64 = min(all_tx_cnt, tx_threshold);
+        let is_final_range = tx_cnt == all_tx_cnt;
+        // get block of this tx
+        let (end_block, tx_cnt) = if is_final_range {
+            (target_block, tx_cnt)
+        } else {
+            // get tx block number
+            let end_block_number =
+                provider.transaction_block(first_tx_num + tx_cnt)?.expect("block of tx must exist");
+            // we want to get range of all transactions of this block, so we are fetching block
+            // body.
+            let end_block_body = provider.block_body_indices(end_block_number)?;
+            (end_block_number, end_block_body.next_tx_num() - first_tx_num)
+        };
+
+        let tx_range = first_tx_num..first_tx_num + tx_cnt;
+        Ok((tx_range, start_block..=end_block, is_final_range))
     }
 }
 

@@ -92,7 +92,7 @@ impl<EF: ExecutorFactory> ExecutionStage<EF> {
         input: ExecInput,
     ) -> Result<ExecOutput, StageError> {
         if input.target_reached() {
-            return Ok(ExecOutput::done(input.checkpoint()));
+            return Ok(ExecOutput::done(input.checkpoint()))
         }
 
         let start_block = input.next_block();
@@ -144,7 +144,7 @@ impl<EF: ExecutorFactory> ExecutionStage<EF> {
 
             // Check if we should commit now
             if self.thresholds.is_end_of_batch(block_number - start_block, 0) {
-                break;
+                break
             }
         }
         let state = executor.take_output_state();
@@ -225,8 +225,8 @@ fn execution_checkpoint<DB: Database>(
                 block_range: CheckpointBlockRange { from: start_block, to: max_block },
                 progress: EntitiesCheckpoint {
                     processed,
-                    total: processed
-                        + calculate_gas_used_from_headers(provider, start_block..=max_block)?,
+                    total: processed +
+                        calculate_gas_used_from_headers(provider, start_block..=max_block)?,
                 },
             }
         }
@@ -309,7 +309,7 @@ impl<EF: ExecutorFactory, DB: Database> Stage<DB> for ExecutionStage<EF> {
         if range.is_empty() {
             return Ok(UnwindOutput {
                 checkpoint: input.checkpoint.with_block_number(input.unwind_to),
-            });
+            })
         }
 
         // get all batches for account change
@@ -352,7 +352,7 @@ impl<EF: ExecutorFactory, DB: Database> Stage<DB> for ExecutionStage<EF> {
         let mut rev_storage_changeset_walker = storage_changeset.walk_back(None)?;
         while let Some((key, _)) = rev_storage_changeset_walker.next().transpose()? {
             if key.block_number() < *range.start() {
-                break;
+                break
             }
             // delete all changesets
             rev_storage_changeset_walker.delete_current()?;
@@ -369,7 +369,7 @@ impl<EF: ExecutorFactory, DB: Database> Stage<DB> for ExecutionStage<EF> {
 
         while let Some(Ok((tx_number, receipt))) = reverse_walker.next() {
             if tx_number < first_tx_num {
-                break;
+                break
             }
             reverse_walker.delete_current()?;
 
@@ -413,8 +413,8 @@ impl ExecutionStageThresholds {
     /// Check if the batch thresholds have been hit.
     #[inline]
     pub fn is_end_of_batch(&self, blocks_processed: u64, changes_processed: u64) -> bool {
-        blocks_processed >= self.max_blocks.unwrap_or(u64::MAX)
-            || changes_processed >= self.max_changes.unwrap_or(u64::MAX)
+        blocks_processed >= self.max_blocks.unwrap_or(u64::MAX) ||
+            changes_processed >= self.max_changes.unwrap_or(u64::MAX)
     }
 }
 
