@@ -33211,6 +33211,7 @@ MDBX_MAYBE_UNUSED unsigned sys_pagesize_ln2, sys_allocation_granularity;
 #endif /* xMDBX_ALLOY */
 
 void osal_ctor(void) {
+  TRACE("osal_ctor");
 #if MDBX_HAVE_PWRITEV && defined(_SC_IOV_MAX)
   osal_iov_max = sysconf(_SC_IOV_MAX);
   if (RUNNING_ON_VALGRIND && osal_iov_max > 64)
@@ -33223,13 +33224,16 @@ void osal_ctor(void) {
   GetSystemInfo(&si);
   sys_pagesize = si.dwPageSize;
   sys_allocation_granularity = si.dwAllocationGranularity;
+  TRACE("win32 get sys info");
 #else
-  sys_pagesize = sysconf(_SC_PAGE_SIZE);
+        TRACE("non-win32 get sys info");
+        sys_pagesize = sysconf(_SC_PAGE_SIZE);
   sys_allocation_granularity = (MDBX_WORDBITS > 32) ? 65536 : 4096;
   sys_allocation_granularity = (sys_allocation_granularity > sys_pagesize)
                                    ? sys_allocation_granularity
                                    : sys_pagesize;
 #endif
+  TRACE("pagesize check");
   assert(sys_pagesize > 0 && (sys_pagesize & (sys_pagesize - 1)) == 0);
   assert(sys_allocation_granularity >= sys_pagesize &&
          sys_allocation_granularity % sys_pagesize == 0);
