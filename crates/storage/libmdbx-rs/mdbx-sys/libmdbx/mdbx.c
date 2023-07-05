@@ -33344,13 +33344,16 @@ static
     mdbx_module_handler(PVOID module, DWORD reason, PVOID reserved)
 #endif /* MDBX_BUILD_SHARED_LIBRARY */
 {
+    TRACE("module handler");
   (void)reserved;
   switch (reason) {
   case DLL_PROCESS_ATTACH:
+  TRACE("module handler>> attach");
     mdbx_winnt_import();
     global_ctor();
     break;
   case DLL_PROCESS_DETACH:
+  TRACE("module handler>> detach");
     global_dtor();
     break;
 
